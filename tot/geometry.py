@@ -326,11 +326,11 @@ def _find_hud(frame: np.ndarray, panel_x0: int, bw: int, bh: int) -> dict[str, R
     """
     # The HUD plates are filled rather than outlined, and their fill is lighter
     # than the counter-box edges, so this threshold is deliberately looser.
-    dark = frame.max(axis=2) < 40
+    dark = frame.max(axis=2) < 60
     cands = [
         r
         for r in solid_rects(dark, min_px=bw * bh)
-        if r.right < panel_x0 and r.w > bw * 1.5 and bh * 0.7 <= r.h <= bh * 1.6 and 2.0 <= r.w / r.h <= 8.0
+        if r.right < panel_x0 and r.w > bw * 1.5 and bh * 0.7 <= r.h <= bh * 1.8 and 2.0 <= r.w / r.h <= 8.0
     ]
     # The value line overruns the dark plate by a pixel or two, which clips the
     # bottom dot of the clock's colon. Extend downwards; the game art below is
