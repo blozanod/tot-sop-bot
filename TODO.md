@@ -60,12 +60,18 @@ and look at the output image. Every button should be boxed with the right state 
 every counter with the right number. If the panel is not found, send me the frame
 it grabbed and I will adjust the detector.
 
-The most likely first-run problems, in order:
+If the canvas is not found, run the probe and send me its output:
 
-1. **Playwright cannot find the canvas** — the emulator may nest it in an iframe or
-   need a click to start. `PlaywrightBackend` searches every frame and clicks once,
-   but this is the one part I could not test.
-2. **The canvas is scaled**, so buttons are not 75×36. The detector keys off the
+```bash
+python -m tools.probe_page
+```
+
+It prints an inventory of every canvas / embed / object / ruffle-* element every
+two seconds, saves a screenshot each time, and leaves the browser open.
+
+Remaining first-run risks:
+
+1. **The canvas is scaled**, so buttons are not 75×36. The detector keys off the
    modal button size rather than absolute pixels, so this *should* just work.
-3. **An unknown colour** — a state the screenshots never showed. It raises with the
+2. **An unknown colour** — a state the screenshots never showed. It raises with the
    sampled hex and the nearest palette entry, which is enough to add it.

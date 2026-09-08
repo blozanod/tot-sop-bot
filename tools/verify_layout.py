@@ -84,15 +84,43 @@ def main() -> int:
     ap.add_argument("-o", "--out", help="output path")
     ap.add_argument("--live", action="store_true", help="grab a frame from the running game")
     ap.add_argument("--url", default=None)
+    ap.add_argument("--wait", type=int, default=60,
+                    help="seconds to wait for the RideControl panel to appear (--live)")
     args = ap.parse_args()
 
     outdir = ROOT / "verify_layout_output"
     if args.live:
+        import time
+
         from tot.backends import DEFAULT_URL, PlaywrightBackend
+        from tot.errors import LayoutError
 
         backend = PlaywrightBackend(url=args.url or DEFAULT_URL, headless=False)
         try:
-            annotate(backend.grab(), Path(args.out) if args.out else outdir / "live.png")
+            print(f"canvas is {backend.canvas_size[0]}x{backend.canvas_size[1]}")
+            # The game may still be on its mode chooser or a loading screen, so
+            # wait for the RideControl panel rather than annotating frame one.
+            out = Path(args.out) if args.out else outdir / "live.png"
+            deadline = time.time() + args.wait
+            last: Exception | None = None
+            while time.time() < deadline:
+                frame = backend.grab()
+                try:
+                    annotate(frame, out)
+                    return 0
+                except LayoutError as exc:
+                    last = exc
+                    time.sleep(1.0)
+            outdir.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(backend.grab()).save(outdir / "live-raw.png")
+            print(
+                f"the panel never appeared within {args.wait}s: {last}\n"
+                f"the raw canvas was saved to {outdir / 'live-raw.png'} — if that shows "
+                f"the mode chooser, pick a game first; if it shows the panel, send me "
+                f"the image and I will adjust the detector.",
+                file=sys.stderr,
+            )
+            return 1
         finally:
             backend.close()
         return 0
