@@ -1,93 +1,71 @@
-# Handoff checklist
+# What is still open
 
-**Status:** 12 screenshots received and fully mined — see
-[`docs/findings.md`](docs/findings.md). Palette, geometry and colour semantics are
-all settled and measured. What's left is small and specific.
+The bot is built and its perception layer is verified against the 12 calibration
+screenshots (44 passing assertions). What remains is knowledge, not code.
 
 ---
 
-## 1. Six more screenshots
+## 1. Three unverified state meanings
 
-Same rules as before: **PNG, 100% zoom, no resizing.** Drop them anywhere in
-`assets/screenshots/` — I'll file and rename them.
+Everything else was observed directly. These three were inferred from the palette's
+consistent semantics but never actually seen, so the bot **flags them in the trace**
+the first time it reads one (`kind: "inferred_state"`).
 
-Your 12 frames ran the whole session with **only TV Room 1 and Elevator 1 in
-service**, so TV Room 2 and Elevators 2 and 3 are gray in every frame. Everything
-below is a gap that leaves a real state unverified.
+| Reading | Why it is a guess | How to settle it |
+| --- | --- | --- |
+| A toggle being **on** | All six RideControl toggles were only ever seen in one state each. Grey-is-off is anchored by the BGM button reading "BGM Disabled" while grey; green-is-on follows but was never watched flip. | One frame with Daytime, Show Fullscreen and BGM on, and Automatic Doors, Ride SFX and TV Room Sound off. |
+| **`Load` in orange** | Load buttons were seen grey, white and green — never orange. It may not be a state that exists. | Any frame where a Load button is orange, or confirmation that it never happens. |
+| **`Dispatch` in white** | Dispatch was seen grey, bright green and bright orange only. | Same. |
 
-### Blocking — I'd be guessing without these
+None of these block a run. If one turns out wrong, the trace shows exactly where
+it was read.
 
-- [ ] **`busy` — all five units in service at once.** TV Room 2 enabled, Elevators 2
-      and 3 enabled, ideally each doing something different. One frame covers 20 of
-      the gaps. It also checks the assumption my whole naming scheme rests on: that
-      unit 2 and 3 render identically to unit 1. If they don't, my grid labelling is
-      wrong and I need to know now.
-- [ ] **`toggles-flipped` — the six RideControl toggles in their opposite states.**
-      Daytime, Show Fullscreen and BGM on; Automatic Doors, Ride SFX and TV Room
-      Sound off. I've only ever seen each of those six in *one* state, so I can't
-      currently tell "on" from "off" for any of them.
+## 2. Game mechanics → [`docs/game-mechanics.md`](docs/game-mechanics.md)
 
-### Wanted — states I suspect exist but have never seen
+Still unanswered, and now the main thing standing between you and a good strategy.
+The frames settled three of the 21 questions on their own:
 
-- [ ] **Entrance door fully open** (I have closed and moving, never open).
-- [ ] **Exit door moving** (I have closed and open, never moving).
-- [ ] **`Load TV Room` or `Load Elevator` in orange**, if either ever goes orange.
-- [ ] **Anything jammed or unusual** — a stuck state, an error, a full queue with
-      guests leaving. Unknown colours make the bot raise, so a surprise state found
-      now is far cheaper than one found mid-run.
+- **What locks the track** — a dispatched elevator. `Dispatch = bright orange` and
+  `Track = Locked` always co-occur.
+- **The two greens** — `#66cc33` is the ordinary palette; `#00ff00` and `#ff9900`
+  belong to `Dispatch Elevator` alone.
+- **Clock speed** — roughly one game-minute per real second, so a 12-hour run is
+  about 12 real minutes.
 
-### Digits — three glyphs, and they're nearly free
-
-All ten digits are confirmed in the small counter font. The large HUD font
-(`Current Time`, `Your score`) is a *different face*, and I'm missing **6, 7 and 9**.
-
-- [ ] Two or three full-window frames where the clock minute or the score contains
-      a 6, 7 or 9 — e.g. `10:16`, `10:27`, `10:59`, or any score like `96`.
-
-**Must be full-window frames, not panel crops** — the HUD sits outside the panel, so
-none of the nine crops contain it.
-
-> You said I only need `0` and `21`. That's true for the TV room Waiting/Loaded
-> boxes, but `Visitor Counter` already reached 84 in your own frames, `Front Waiting`
-> ranged 16–21, and the score passed 211 in 44 game-minutes. The clock alone walks
-> through every digit on its way from 10:00 to 22:00. If I can't read those, I can't
-> read the score — and the score is how we compare strategies.
-
-## 2. Game mechanics prose → [`docs/game-mechanics.md`](docs/game-mechanics.md)
-
-Still needed. Three of the 21 questions are now answered by the frames themselves
-(what blocks the track, what the two greens mean, roughly how fast the clock runs) —
-I've noted those in the file. The rest is knowledge only you have.
-
-Highest value now that the colours are settled: **scoring** (Q15) and **capacities**
-(Q5, Q10). Strategy is meaningless until we know what earns points.
+The rest is yours. **Scoring (Q15) and capacities (Q5, Q10) matter most** — strategy
+is guesswork until we know what earns points.
 
 ## 3. TM Arcade access
 
-- [ ] The **Arcade URL** for the timed game.
-- [ ] Does it need an **account or login**, or any click-through before the game loads?
+`main.py` currently points at the Simulation Page, which only offers the Unlimited
+game. For the timed, scored run I need:
+
+- [ ] The **Arcade URL**.
+- [ ] Whether it needs a **login**, or any click-through before the game loads.
 - [ ] A screenshot of the **game-over screen**, if the timed mode has one.
 
-> **Do not commit credentials.** Say a login is needed and I'll wire it to
+> **Do not commit credentials.** Say a login is needed and I will wire it to
 > environment variables.
 
-## 4. Environment
+## 4. First live run
 
-- [ ] **OS and version** of the machine that will run the bot.
-- [ ] **Python version** (`python3 -V`).
+Nothing in this repo has touched the actual game — I could not reach it from the
+build environment. Before writing strategy, run:
 
-> No longer needed: the canvas bounding box. The bot now detects the button grid
-> itself, so canvas size and zoom don't matter. See `findings.md` §4.
+```bash
+python -m tools.verify_layout --live
+```
 
----
+and look at the output image. Every button should be boxed with the right state and
+every counter with the right number. If the panel is not found, send me the frame
+it grabbed and I will adjust the detector.
 
-## Then I build
+The most likely first-run problems, in order:
 
-- Playwright + Chromium backend, PNG fixture backend, desktop fallback
-- Grid auto-detection with the eight measured colours
-- Grayscale-correlation digit reader, both fonts
-- `Elevator` ×3, `TVRoom` ×2, `RideControl`, `Track` — strict 1:1 properties,
-  enum + bool per button
-- JSONL trace with plain-English glosses and cue-to-click timing
-- Fixture tests asserting the state table in `findings.md` §3
-- A bare `main.py` skeleton — **the strategy stays yours**
+1. **Playwright cannot find the canvas** — the emulator may nest it in an iframe or
+   need a click to start. `PlaywrightBackend` searches every frame and clicks once,
+   but this is the one part I could not test.
+2. **The canvas is scaled**, so buttons are not 75×36. The detector keys off the
+   modal button size rather than absolute pixels, so this *should* just work.
+3. **An unknown colour** — a state the screenshots never showed. It raises with the
+   sampled hex and the nearest palette entry, which is enough to add it.

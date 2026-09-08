@@ -19,11 +19,11 @@ so classification is an equality test, not a nearest-match problem.
 | `#ff9933` | `ORANGE` | door moving, or action ready | most buttons |
 | `#00ff00` | `BRIGHT_GREEN` | **ready to dispatch** | Dispatch only |
 | `#ff9900` | `BRIGHT_ORANGE` | **dispatched, in motion** | Dispatch only |
-| `#ff0000` | `RED` | Track blocked | Track only |
+| `#ff0000` | `RED` | Track locked | Track only |
 
 ### Three corrections to what we assumed
 
-**Red is `#ff0000`, not `#ef0817`.** The Track-blocked button measures pure red in
+**Red is `#ff0000`, not `#ef0817`.** The Track Locked button measures pure red in
 `11-dispatched-track-blocked`. `#ef0817` is presumably the small indicator lights in
 the ride diagram, which are not a control. Had we calibrated on `#ef0817`, the
 distance from `#ff0000` is large enough that a strict matcher would have raised on
@@ -91,7 +91,7 @@ assert against.
 | `153341` | WHITE | WHITE | WHITE | WHITE | GREEN | ORANGE | GREEN | WHITE | WHITE | BORANGE | WHITE | RED |
 
 Read down the last two columns of the final row: `Dispatch = BRIGHT_ORANGE` and
-`Track = RED` occur together, which means **the dispatched elevator is what blocks
+`Track = RED` occur together, which means **the dispatched elevator is what locks
 the track**. That is one of the mechanics questions answered for free.
 
 The TV Room 1 cycle also reads straight off the table:

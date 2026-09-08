@@ -17,3 +17,5 @@ Thumbs.db
 
 # NOTE: assets/screenshots/**/*.png is deliberately NOT ignored.
 # Those screenshots are calibration source data and must be committed.
+# tot/templates.npz is also committed: it is derived from them.
+!tot/templates.npz
