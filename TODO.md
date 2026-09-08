@@ -1,73 +1,93 @@
-# Handoff checklist — what I need before I build
+# Handoff checklist
 
-Everything below is blocking. Order roughly matters: **1 and 2 unblock the most.**
+**Status:** 12 screenshots received and fully mined — see
+[`docs/findings.md`](docs/findings.md). Palette, geometry and colour semantics are
+all settled and measured. What's left is small and specific.
 
 ---
 
-## 1. Screenshots → `assets/screenshots/`
+## 1. Six more screenshots
 
-Full spec, naming, and the situation-by-situation list: **[`assets/screenshots/README.md`](assets/screenshots/README.md)**
+Same rules as before: **PNG, 100% zoom, no resizing.** Drop them anywhere in
+`assets/screenshots/` — I'll file and rename them.
 
-Short version:
+Your 12 frames ran the whole session with **only TV Room 1 and Elevator 1 in
+service**, so TV Room 2 and Elevators 2 and 3 are gray in every frame. Everything
+below is a gap that leaves a real state unverified.
 
-- **PNG only.** JPEG smears exactly the colour boundaries I sample.
-- **Browser zoom at 100%**, no resizing after capture.
-- Whole-window captures are fine — I'll locate the canvas myself.
-- Three folders: `layout/` (one clean master), `states/` (one frame per game
-  situation), `digits/` (a spray of frames from one run).
-- **More is strictly better.** Duplicates cost me nothing. A missing state means
-  I ship a colour I have never seen and cannot verify.
+### Blocking — I'd be guessing without these
 
-The single highest-value one, if you only do a few: `states/23-track-blocked.png`.
-Red `#ef0817` is the only value I have confirmed, so it's my anchor for
-calibrating everything else.
+- [ ] **`busy` — all five units in service at once.** TV Room 2 enabled, Elevators 2
+      and 3 enabled, ideally each doing something different. One frame covers 20 of
+      the gaps. It also checks the assumption my whole naming scheme rests on: that
+      unit 2 and 3 render identically to unit 1. If they don't, my grid labelling is
+      wrong and I need to know now.
+- [ ] **`toggles-flipped` — the six RideControl toggles in their opposite states.**
+      Daytime, Show Fullscreen and BGM on; Automatic Doors, Ride SFX and TV Room
+      Sound off. I've only ever seen each of those six in *one* state, so I can't
+      currently tell "on" from "off" for any of them.
 
-## 2. Game mechanics prose → `docs/game-mechanics.md`
+### Wanted — states I suspect exist but have never seen
 
-The file is a template with the specific questions I need answered. Prose is
-fine, bullets are fine — no need to be tidy.
+- [ ] **Entrance door fully open** (I have closed and moving, never open).
+- [ ] **Exit door moving** (I have closed and open, never moving).
+- [ ] **`Load TV Room` or `Load Elevator` in orange**, if either ever goes orange.
+- [ ] **Anything jammed or unusual** — a stuck state, an error, a full queue with
+      guests leaving. Unknown colours make the bot raise, so a surprise state found
+      now is far cheaper than one found mid-run.
 
-This is knowledge only you have. Without it my plain-English state descriptions
-are guesses wearing the costume of documentation, which is worse than having
-none. **Question 12 (the two greens) is the one I most need right.**
+### Digits — three glyphs, and they're nearly free
+
+All ten digits are confirmed in the small counter font. The large HUD font
+(`Current Time`, `Your score`) is a *different face*, and I'm missing **6, 7 and 9**.
+
+- [ ] Two or three full-window frames where the clock minute or the score contains
+      a 6, 7 or 9 — e.g. `10:16`, `10:27`, `10:59`, or any score like `96`.
+
+**Must be full-window frames, not panel crops** — the HUD sits outside the panel, so
+none of the nine crops contain it.
+
+> You said I only need `0` and `21`. That's true for the TV room Waiting/Loaded
+> boxes, but `Visitor Counter` already reached 84 in your own frames, `Front Waiting`
+> ranged 16–21, and the score passed 211 in 44 game-minutes. The clock alone walks
+> through every digit on its way from 10:00 to 22:00. If I can't read those, I can't
+> read the score — and the score is how we compare strategies.
+
+## 2. Game mechanics prose → [`docs/game-mechanics.md`](docs/game-mechanics.md)
+
+Still needed. Three of the 21 questions are now answered by the frames themselves
+(what blocks the track, what the two greens mean, roughly how fast the clock runs) —
+I've noted those in the file. The rest is knowledge only you have.
+
+Highest value now that the colours are settled: **scoring** (Q15) and **capacities**
+(Q5, Q10). Strategy is meaningless until we know what earns points.
 
 ## 3. TM Arcade access
 
-You picked the timed 12-hour scored game as the optimisation target, which lives
-in the TM Arcade rather than the Simulation Page URL you gave me. I need:
+- [ ] The **Arcade URL** for the timed game.
+- [ ] Does it need an **account or login**, or any click-through before the game loads?
+- [ ] A screenshot of the **game-over screen**, if the timed mode has one.
 
-- [ ] The **Arcade URL** for the game.
-- [ ] Does it need an **account or login**? Any click-through before the game
-      loads (cookie banner, age gate, "click to play" for the Flash emulator)?
-- [ ] Does the timed mode show a **game-over screen** at 12 hours? A screenshot
-      of it goes in `states/90-game-over.png`.
+> **Do not commit credentials.** Say a login is needed and I'll wire it to
+> environment variables.
 
-> **Do not commit credentials.** If a login is needed, say so here and I'll wire
-> it to environment variables. Never put a password in this repo.
+## 4. Environment
 
-## 4. Environment details
-
-- [ ] **OS and version** on the machine that will run the bot.
+- [ ] **OS and version** of the machine that will run the bot.
 - [ ] **Python version** (`python3 -V`).
-- [ ] **Canvas pixel size**, if you can get it. In the browser devtools console:
-      `document.querySelector('canvas').getBoundingClientRect()`.
-      If the canvas is inside an iframe, tell me — it changes how I attach.
+
+> No longer needed: the canvas bounding box. The bot now detects the button grid
+> itself, so canvas size and zoom don't matter. See `findings.md` §4.
 
 ---
 
 ## Then I build
 
-Once 1–4 land I write the whole stack in one pass:
-
-- Playwright + Chromium backend, fixture (PNG) backend, and the desktop fallback
-- Colour palette sampled from your real pixels, not guessed
-- Coordinate table + `verify_layout.py` overlay so you can eyeball every probe
-  point in a single image
-- Digit template matching for all the counters, clock and score
-- `Elevator` ×3, `TVRoom` ×2, `RideControl`, `Track` classes — strict 1:1
-  properties, enum + bool on every button
-- JSONL run trace with plain-English glosses
-- Fixture tests asserting real readings against your PNGs
+- Playwright + Chromium backend, PNG fixture backend, desktop fallback
+- Grid auto-detection with the eight measured colours
+- Grayscale-correlation digit reader, both fonts
+- `Elevator` ×3, `TVRoom` ×2, `RideControl`, `Track` — strict 1:1 properties,
+  enum + bool per button
+- JSONL trace with plain-English glosses and cue-to-click timing
+- Fixture tests asserting the state table in `findings.md` §3
 - A bare `main.py` skeleton — **the strategy stays yours**
-
-Design rationale for all 20 decisions: [`docs/design-decisions.md`](docs/design-decisions.md)

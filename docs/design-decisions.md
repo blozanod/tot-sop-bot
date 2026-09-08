@@ -46,6 +46,15 @@ every time. Exact and deterministic, with no OCR dependency. Rejected Tesseract:
 small crisp digits are precisely where it confuses 8/3 and 1/7, and a misread
 count corrupts strategy silently instead of erroring.
 
+> **Amended after measuring the screenshots.** Digits are *not* pixel-identical:
+> the same glyph renders with 1–2 pixels of anti-aliasing difference depending on
+> sub-pixel position (the digit `0` produced six distinct bitmaps across the 12
+> frames). Exact template equality would fail unpredictably. The reader now uses
+> **normalised grayscale correlation** against ten templates per font, with a
+> confidence floor below which it raises. The guarantee is unchanged — a bad read
+> errors rather than lying — but the method tolerates the jitter that is really
+> there. Two fonts are needed: the 11–12 px counter face and the 29 px HUD face.
+
 **5. Palette sampled from committed PNGs, plus a live calibrator.**
 Correct on day one from real pixels, and self-healing if the emulator renders
 differently on the target machine. Guessing was rejected outright: the "two
@@ -68,7 +77,11 @@ never have is a button silently classified wrong while the strategy quietly does
 nothing — which is indistinguishable from a legitimate game state. A loud crash
 on run one is cheap.
 
-**8. Text channel designed in, enabled only where needed.**
+**8. Text channel designed in, enabled only where needed.** *(Now: probably not
+needed.)* The one suspected colour collision — `Attraction Closed` vs
+`Attraction Active` — turned out to be `#cccccc` vs `#ffffff`, distinguishable
+exactly. No collision remains among the 32 buttons across the frames available, so
+the machinery gets built but stays dormant. Revisit if a new state shows up.
 Every button spec carries an optional text region; the label-matching machinery
 gets built but switches on only for buttons where the screenshots show two
 distinct meanings sharing one colour. Pay the cost only where colour is genuinely
@@ -142,6 +155,10 @@ sees. Keeping the mapping beside the enum that defines it stops the two drifting
 **18. Target: the timed 12-hour scored game in the TM Arcade.**
 Not the Simulation Page link, which only offers Unlimited. Needs the Arcade URL
 and a decision about login. *(Open — see `TODO.md`.)*
+
+> The screenshots show the clock advancing ~1 game-minute per real second, so a
+> full 12-hour run is only **~12 real minutes**. The worry that scored runs would
+> be too slow to iterate on does not apply.
 
 **19. Mechanics documented by you, in prose.**
 Guest flow, capacities, scoring and what blocks the track are knowledge only you
