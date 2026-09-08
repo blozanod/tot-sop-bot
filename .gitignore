@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Run output
+logs/
+*.jsonl
+verify_layout_output/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# NOTE: assets/screenshots/**/*.png is deliberately NOT ignored.
+# Those screenshots are calibration source data and must be committed.
