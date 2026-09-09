@@ -46,8 +46,8 @@ Write your strategy in [`main.py`](main.py); it lists the full readable surface.
 
 | | |
 | --- | --- |
-| **Sees** | Screenshots **only the RideControl panel** — about 930×290 px, an eighth of the canvas. No hardcoded coordinates: the panel is found from the pixels once, at startup, and that rectangle is what gets captured from then on. |
-| **Stays out of the way** | Never scrolls, resizes or clicks on its own. Your view of the game does not move while it plays — see below. |
+| **Sees** | Reads **only the RideControl panel** — about 930×290 px, an eighth of the canvas. No hardcoded coordinates: the panel is found from the pixels once, at startup, and that rectangle is all that gets decoded from then on. |
+| **Stays out of the way** | Never clicks, scrolls or resizes on its own, and never asks the browser for a screenshot. Your view of the game does not move or flicker while it plays — see below. |
 | **Classifies** | Eight exact flat fills. All 32 buttons are read in one vectorised majority vote over 288 probe pixels — 0.05 ms. |
 | **Counts** | Only **0** and **21**. Every other value is `OTHER`, because every other value means the same thing: wait. Counters are read lazily, so a tick that only looks at colours never touches a digit. |
 | **Acts** | Clicks and nothing else — no precondition checks, no waiting for animations. That is your job. |
@@ -59,31 +59,40 @@ Measured with `python -m tools.benchmark`:
 | | |
 | --- | --- |
 | locate the panel, full canvas | 77 ms — **once**, at startup |
-| screenshot the panel crop | ~13 ms — the browser's cost, not ours |
+| wait for a painted frame | ~14 ms — the compositor's cadence |
+| decode it | ~27 ms |
 | read all 32 buttons | 0.05 ms |
 | read one counter | 0.3 ms |
-| **a whole tick** | **~19 ms → ~51 Hz** |
+| **a whole tick** | **~41 ms → ~24 Hz** |
 
 The screenshot is 90% of that and is entirely the browser's. See
 [`docs/design-decisions.md`](docs/design-decisions.md) §21 for why the bot is
 still in Python.
 
-### It never moves your page
+### It never disturbs your view
 
-The window is opened maximised and then left completely alone: no scrolling, no
-resizing, no clicking anything you did not ask for. Capture goes through CDP
-rather than Playwright's screenshot helper specifically to keep that promise —
-the two obvious alternatives both move the page under you:
+The window is opened maximised and then left completely alone. It is not just
+that the bot does not scroll — **it never asks the browser for a screenshot at
+all**, because every way of asking disturbs something:
 
 | | |
 | --- | --- |
 | `page.screenshot(clip=…)` | refuses a clip outside the window, so reaching a panel below the fold means **scrolling the page to it** |
-| CDP `captureBeyondViewport` | reaches it without scrolling, but fires a **`resize` event on every capture** — 47 a second, into an emulator that relays out its canvas on resize |
+| CDP `captureBeyondViewport` | reaches it without scrolling, but fires a **`resize` on the page for every capture** |
+| CDP clipped capture | in a headed window this makes the page **visibly flash, resized to the clip** |
 
-So the capture rect is intersected with whatever is currently on screen. If the
-panel is off the bottom of the window the crop comes back short, the panel simply
-is not found, and the bot keeps waiting — and tells you to enlarge the window or
-scroll it into view yourself.
+Instead the compositor pushes frames it has already painted, over
+`Page.startScreencast` — the same channel DevTools uses for its device preview.
+There is no capture request, so there is nothing that could resize anything, and
+the panel crop happens in numpy where it costs nothing.
+
+The bill for that is real: a whole-window frame has to be decoded rather than a
+small clip, which is ~27 ms instead of ~2. A tick is 41 ms instead of 19. Worth
+it — 24 Hz is still twenty times faster than the game asks for, and the game is
+what you are trying to watch.
+
+If the panel is off the bottom of the window it simply is not found, the bot keeps
+waiting, and it tells you to enlarge the window or scroll it into view yourself.
 
 ### One property, one observable
 

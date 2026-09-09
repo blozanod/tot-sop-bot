@@ -67,8 +67,8 @@ def live(url: str, wait: float) -> int:
             print("never saw the panel", file=sys.stderr)
             return 1
         r = game.layout.region
-        print(f"  panel crop is {r.w}x{r.h} of a {backend.canvas_size} canvas")
-        print(f"  full tick (screenshot + 32 buttons)       {timed(game.refresh, 100):7.1f} ms")
+        print(f"  panel crop is {r.w}x{r.h}; the game canvas is {backend.canvas_size}")
+        print(f"  full tick (frame + decode + 32 buttons)   {timed(game.refresh, 100):7.1f} ms")
 
         def with_counter() -> None:
             game.refresh()

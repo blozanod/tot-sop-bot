@@ -1,36 +1,26 @@
 """Where frames come from and where clicks go.
 
-``PlaywrightBackend``  the real thing — drives its own Chromium and screenshots a
-                       clipped rectangle of the page.
+``PlaywrightBackend``  the real thing — drives its own Chromium and reads frames
+                       out of it without ever touching the page.
 ``ImageBackend``       serves a PNG as "the current frame", so the whole stack runs
                        with no browser. That is how the fixture tests work.
 
-Two things make the live backend fast, and both are about *not capturing pixels*:
+The live backend's one hard rule: **nothing it does may change what you see.** You
+are watching the game while it plays, so it never clicks on its own, never
+scrolls, never resizes, and never asks the browser for anything that might.
 
-1. Once the panel has been located, ``set_region`` clips every subsequent
-   screenshot to it. Capturing the whole canvas costs ~85 ms; the panel crop costs
-   ~19 ms, and the pixels outside it were never read.
-2. Chromium is launched with ``--disable-frame-rate-limit``. Without it a
-   screenshot waits for the compositor's next 30 Hz frame, which by itself put a
-   ~33 ms floor under every capture regardless of size.
+That rule is what picks the capture method. Asking Chromium for a *clipped*
+screenshot is the obvious way to read only the panel, and it is 30 ms a tick
+cheaper — but in a headed window a clipped capture makes the page visibly flash,
+resized to the clip. So frames are not requested at all: ``Page.startScreencast``
+has the compositor push whatever it has already painted, the same channel
+DevTools uses for its device preview. There is no capture request, so there is
+nothing that can resize anything, and the panel crop happens here in numpy where
+it costs nothing.
 
-It also never *touches* the page. It clicks nothing on its own — you load the game
-and pick the mode — and it never scrolls, resizes or otherwise moves what you are
-watching. Capturing goes through CDP directly rather than through Playwright's
-screenshot helper, for exactly that reason:
-
-* ``page.screenshot(clip=...)`` refuses a clip outside the viewport, so reaching a
-  panel below the fold means scrolling the page to it. That is visible.
-* CDP's ``captureBeyondViewport`` reaches it without scrolling, but fires a
-  ``resize`` event on the page for *every* capture — 47 times a second, into an
-  emulator that relays out its canvas on resize. Also visible, and a fair suspect
-  for the crashes.
-* CDP with ``captureBeyondViewport: false`` moves nothing at all, and is 6 ms
-  faster than the Playwright helper besides. So the capture rect is intersected
-  with whatever is currently on screen, and the bot works with what it can see.
-
-If the panel is off-screen the crop comes back short, the panel is simply not
-found, and the bot keeps waiting — rather than yanking your view to reach it.
+Screencast frames are PNG, so the flat button fills come back bit-exact — which
+the whole colour-reading approach depends on. JPEG would be faster and smaller and
+is not an option for that reason.
 """
 
 from __future__ import annotations
@@ -60,7 +50,7 @@ class Backend(Protocol):
         """The current frame as an (H, W, 3) uint8 RGB array."""
 
     def set_region(self, region: Rect | None) -> None:
-        """Restrict later grabs to ``region`` of the current frame, or undo that."""
+        """Restrict later grabs to ``region`` of the full frame, or undo that."""
 
     def click(self, x: int, y: int) -> None:
         """Click at a point in the *current* frame's coordinates."""
@@ -68,10 +58,13 @@ class Backend(Protocol):
     def close(self) -> None: ...
 
 
-def _png_to_array(data: bytes) -> np.ndarray:
-    from PIL import Image
-
-    return np.array(Image.open(io.BytesIO(data)).convert("RGB"))
+def _to_array(im: Any, region: Rect | None) -> np.ndarray:
+    """A decoded image as RGB, cropped, without a redundant conversion pass."""
+    if im.mode not in ("RGB", "RGBA"):
+        im = im.convert("RGB")
+    if region is not None:
+        im = im.crop((region.x, region.y, region.right, region.bottom))
+    return np.asarray(im)[..., :3]
 
 
 class ImageBackend:
@@ -120,10 +113,15 @@ RUFFLE_CONFIG: dict[str, Any] = {
 }
 
 #: Flags that matter, and why:
-#:   frame-rate-limit  a capped compositor puts a 33 ms floor under every capture
-#:   backgrounding     a window that loses focus otherwise gets throttled to 1 Hz
-#:   mute-audio        the game's sound is pure cost to us, and muting it also
-#:                     stops Ruffle wanting a click to unmute
+#:   backgrounding  a window that loses focus otherwise gets throttled to 1 Hz,
+#:                  and the screencast stops with it
+#:   mute-audio     the game's sound is pure cost to us, and muting it also stops
+#:                  Ruffle wanting a click to unmute
+#:
+#: Deliberately absent: --disable-frame-rate-limit and --disable-gpu-vsync. They
+#: bought a few ms back when every tick asked for a screenshot, and uncapping a
+#: compositor is a plausible way to make a real display flicker. The screencast
+#: takes frames at whatever rate the page paints, so neither is needed.
 _CHROME_ARGS = (
     "--mute-audio",
     "--autoplay-policy=no-user-gesture-required",
@@ -134,63 +132,38 @@ _CHROME_ARGS = (
 )
 
 
-def visible_clip(
-    box: dict[str, float] | None,
-    region: Rect | None,
-    view: dict[str, float],
-) -> dict[str, float]:
-    """The rect to capture, in page coordinates, trimmed to what is on screen.
-
-    ``box`` is the canvas in page coordinates, ``region`` the panel crop within
-    it, ``view`` the window's scroll position and size. Trimming rather than
-    scrolling is the whole point: if the panel is half off the bottom of the
-    window, this returns the half that is showing, the panel is not found, and
-    the bot waits — instead of moving the page out from under the person
-    watching the game.
-    """
-    if box is None:
-        return {"x": float(view["x"]), "y": float(view["y"]),
-                "width": float(view["w"]), "height": float(view["h"])}
-    x0, y0 = box["px"], box["py"]
-    x1, y1 = x0 + box["w"], y0 + box["h"]
-    if region is not None:
-        x0, y0 = x0 + region.x, y0 + region.y
-        x1, y1 = x0 + region.w, y0 + region.h
-    x0, y0 = max(x0, view["x"]), max(y0, view["y"])
-    x1 = min(x1, view["x"] + view["w"])
-    y1 = min(y1, view["y"] + view["h"])
-    return {"x": float(x0), "y": float(y0),
-            "width": float(max(1, x1 - x0)), "height": float(max(1, y1 - y0))}
-
-
 class PlaywrightBackend:
-    """Drives Chromium and screenshots a rectangle of the page."""
+    """Drives Chromium and reads the frames it is already painting."""
 
     #: Walks open shadow roots, because Ruffle mounts its canvas inside a
-    #: <ruffle-player> custom element rather than in the light DOM.
-    _FIND_JS = r"""
+    #: <ruffle-player> custom element rather than in the light DOM. Diagnostics
+    #: only — capture does not care where the canvas is.
+    _INVENTORY_JS = r"""
     () => {
-      const found = [];
+      const inv = {};
+      let canvas = null;
       const visit = (root) => {
         let els;
         try { els = root.querySelectorAll('*'); } catch (e) { return; }
         for (const el of els) {
           const tag = el.tagName.toLowerCase();
-          if (tag === 'canvas' || tag === 'embed' || tag === 'object' ||
-              tag.startsWith('ruffle-')) found.push(el);
+          if (['canvas','embed','object','iframe'].includes(tag) || tag.startsWith('ruffle-')) {
+            const r = el.getBoundingClientRect();
+            (inv[tag] = inv[tag] || []).push(Math.round(r.width) + 'x' + Math.round(r.height));
+            if (tag === 'canvas' && (!canvas || r.width * r.height > canvas.w * canvas.h))
+              canvas = {x: r.left, y: r.top, w: r.width, h: r.height};
+          }
           if (el.shadowRoot) visit(el.shadowRoot);
         }
       };
       visit(document);
-      const canvases = found.filter(e => e.tagName.toLowerCase() === 'canvas');
-      const pool = canvases.length ? canvases : found;
-      let best = null, area = -1;
-      for (const el of pool) {
-        const r = el.getBoundingClientRect();
-        const a = r.width * r.height;
-        if (a > area) { best = el; area = a; }
-      }
-      return best;
+      return {
+        title: document.title,
+        elements: inv,
+        canvas: canvas,
+        view: {w: window.innerWidth, h: window.innerHeight},
+        text: document.body ? document.body.innerText.replace(/\s+/g, ' ').slice(0, 300) : ''
+      };
     }
     """
 
@@ -218,41 +191,7 @@ class PlaywrightBackend:
     }
     """
 
-    _INVENTORY_JS = r"""
-    () => {
-      const inv = {};
-      const visit = (root) => {
-        let els;
-        try { els = root.querySelectorAll('*'); } catch (e) { return; }
-        for (const el of els) {
-          const tag = el.tagName.toLowerCase();
-          if (['canvas','embed','object','iframe'].includes(tag) || tag.startsWith('ruffle-')) {
-            const r = el.getBoundingClientRect();
-            (inv[tag] = inv[tag] || []).push(Math.round(r.width) + 'x' + Math.round(r.height));
-          }
-          if (el.shadowRoot) visit(el.shadowRoot);
-        }
-      };
-      visit(document);
-      return {
-        title: document.title,
-        elements: inv,
-        text: document.body ? document.body.innerText.replace(/\s+/g, ' ').slice(0, 300) : ''
-      };
-    }
-    """
-
-    _BOX_JS = r"""
-    (el) => {
-      const r = el.getBoundingClientRect();
-      return {px: r.left + window.scrollX, py: r.top + window.scrollY,
-              w: r.width, h: r.height};
-    }
-    """
-
-    #: Where the window is looking, in page coordinates.
-    _VIEW_JS = "() => ({x: window.scrollX, y: window.scrollY, " \
-               "w: window.innerWidth, h: window.innerHeight})"
+    _VIEW_JS = "() => [window.innerWidth, window.innerHeight]"
 
     def __init__(
         self,
@@ -260,8 +199,7 @@ class PlaywrightBackend:
         headless: bool = False,
         viewport: tuple[int, int] | None = None,
         timeout_ms: int = 90_000,
-        min_canvas_px: int = 100_000,
-        uncapped_capture: bool = True,
+        frame_wait_ms: int = 60,
         ruffle_config: dict[str, Any] | None = None,
         debug_dir: str | Path | None = "debug_output",
     ):
@@ -274,18 +212,18 @@ class PlaywrightBackend:
             ) from exc
 
         self.url = url
-        self.min_canvas_px = min_canvas_px
+        self.frame_wait_ms = frame_wait_ms
         self.debug_dir = Path(debug_dir) if debug_dir else None
         self._region: Rect | None = None
-        self._canvas: Any = None
-        self._box: dict[str, float] | None = None
-        self._clip: dict[str, float] | None = None
+        self._frame_b64: str | None = None
+        self._frame_seq = 0
+        self._taken_seq = -1
+        self._frame_size: tuple[int, int] | None = None
+        self._scale = 1.0
 
         args = list(_CHROME_ARGS)
-        if uncapped_capture:
-            args += ["--disable-frame-rate-limit", "--disable-gpu-vsync"]
-        # A maximised window is the one way to make sure the whole game is on
-        # screen without the bot ever having to move the page to reach part of it.
+        # A maximised window is the one way to be sure the whole game is on screen
+        # without the bot ever needing to move the page to see part of it.
         if viewport is None and not headless:
             args.append("--start-maximized")
 
@@ -297,10 +235,6 @@ class PlaywrightBackend:
                 **({} if viewport is None else
                    {"viewport": {"width": viewport[0], "height": viewport[1]}}),
             )
-            try:
-                self._cdp: Any = self._page.context.new_cdp_session(self._page)
-            except Exception:  # pragma: no cover - non-Chromium, in theory
-                self._cdp = None
             cfg = json.dumps({**RUFFLE_CONFIG, **(ruffle_config or {})})
             self._page.add_init_script(
                 "window.RufflePlayer = window.RufflePlayer || {};"
@@ -308,118 +242,98 @@ class PlaywrightBackend:
                 f"{{}}, window.RufflePlayer.config || {{}}, {cfg});"
             )
             self._page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+            self._cdp: Any = self._page.context.new_cdp_session(self._page)
+            self._start_screencast()
         except Exception:
             self.close()
             raise
 
-    # -- attaching ------------------------------------------------------------
-    def attach(self) -> bool:
-        """Try to find the player canvas. Safe to call repeatedly.
-
-        Returns False rather than raising while the emulator is still starting —
-        the caller is in a wait loop, not an error path.
-        """
-        if self._canvas is not None and self._box is not None:
-            return True
-        best, area = None, -1.0
-        for frame in self._page.frames:
-            try:
-                el = frame.evaluate_handle(self._FIND_JS).as_element()
-            except Exception:
-                continue
-            if el is None:
-                continue
-            box = el.bounding_box()
-            a = box["width"] * box["height"] if box else 0.0
-            if a > area:
-                best, area = el, a
-        if best is None or area < self.min_canvas_px:
-            return False
-        # Deliberately no scroll_into_view_if_needed: moving the page to bring the
-        # game into frame is the one thing this class must never do.
-        self._canvas = best
-        self._box = self._page.evaluate(self._BOX_JS, best)
-        self._recompute_clip()
-        return True
-
-    @property
-    def canvas_size(self) -> tuple[int, int] | None:
-        return None if self._box is None else (int(self._box["w"]), int(self._box["h"]))
-
     # -- frames ---------------------------------------------------------------
-    def _recompute_clip(self) -> dict[str, float]:
-        """What to capture, in page coordinates, intersected with the window.
-
-        Cached, because the hot path must not spend a round trip per frame asking
-        the page where it is. It is recomputed whenever the region changes or the
-        canvas is re-attached — and if you scroll the panel off screen in between,
-        the crop comes back short, the probes miss, and that re-attach happens on
-        the very next tick.
-        """
-        self._clip = visible_clip(
-            self._box, self._region, self._page.evaluate(self._VIEW_JS)
+    def _start_screencast(self) -> None:
+        """Ask the compositor to push what it paints. Nothing is requested per
+        frame, so there is no per-frame call that could disturb the page."""
+        self._cdp.on("Page.screencastFrame", self._on_frame)
+        self._cdp.send(
+            "Page.startScreencast",
+            # maxWidth/maxHeight are set past any real window on purpose: a frame
+            # scaled to fit them would resample the flat fills, and reading them
+            # exactly is the whole basis of the colour classification.
+            {"format": "png", "maxWidth": 8000, "maxHeight": 8000, "everyNthFrame": 1},
         )
-        return self._clip
 
-    def visible_fraction(self) -> float:
-        """How much of the game canvas is actually on screen, 0.0 to 1.0."""
-        if self._box is None:
-            return 0.0
-        view = self._page.evaluate(self._VIEW_JS)
-        w = min(self._box["px"] + self._box["w"], view["x"] + view["w"]) - max(
-            self._box["px"], view["x"])
-        h = min(self._box["py"] + self._box["h"], view["y"] + view["h"]) - max(
-            self._box["py"], view["y"])
-        area = self._box["w"] * self._box["h"]
-        return max(0.0, w) * max(0.0, h) / area if area else 0.0
+    def _on_frame(self, event: dict) -> None:
+        self._frame_b64 = event.get("data")
+        self._frame_seq += 1
+        # Chromium holds the next frame until this one is acknowledged, so the ack
+        # is what paces the stream — and it goes out on arrival, not when the
+        # frame is taken. Waiting until then measured 59 ms a tick against 41 ms,
+        # because it costs a whole paint cycle; the frames that go unread in
+        # exchange cost only bandwidth down a local socket, never a decode.
+        try:
+            self._cdp.send("Page.screencastFrameAck", {"sessionId": event["sessionId"]})
+        except Exception:
+            pass
 
-    def grab(self) -> np.ndarray:
-        if not self.attach() or self._clip is None:
-            self._recompute_clip()
-        assert self._clip is not None
-        return _png_to_array(self._capture(self._clip))
+    def _latest_frame(self) -> str:
+        """The newest painted frame, waiting briefly for one if it is due.
 
-    def _capture(self, clip: dict[str, float]) -> bytes:
-        if self._cdp is not None:
+        A page that is not animating — a mode chooser, a paused game — simply
+        stops producing frames, so this settles for the last one rather than
+        blocking. Only if none has ever arrived does it fall back to asking.
+        """
+        deadline = time.monotonic() + self.frame_wait_ms / 1000
+        while self._frame_seq == self._taken_seq:
+            if time.monotonic() >= deadline:
+                break
+            self._page.wait_for_timeout(2)
+        self._taken_seq = self._frame_seq
+        if self._frame_b64 is None:
+            # No screencast at all. A whole-viewport capture takes the same path
+            # through the compositor and, crucially, carries no clip.
             reply = self._cdp.send(
                 "Page.captureScreenshot",
-                {
-                    "format": "png",
-                    "clip": {**clip, "scale": 1},
-                    # Both False on purpose: see the module docstring. Either one
-                    # true means the page moves under the person watching it.
-                    "captureBeyondViewport": False,
-                    "fromSurface": True,
-                },
+                {"format": "png", "fromSurface": True, "captureBeyondViewport": False},
             )
-            return base64.b64decode(reply["data"])
-        return self._page.screenshot(clip=clip)
+            self._frame_b64 = reply["data"]
+        return self._frame_b64
+
+    def grab(self) -> np.ndarray:
+        from PIL import Image
+
+        im = Image.open(io.BytesIO(base64.b64decode(self._latest_frame())))
+        self._frame_size = im.size
+        return _to_array(im, self._region)
 
     def set_region(self, region: Rect | None) -> None:
-        if region is not None and self._box is None:
-            raise BrowserError("cannot clip to the panel before the canvas is attached")
+        """Record the panel crop. Applied here in numpy, never in the browser."""
         self._region = region
-        if region is None:
-            # Back to searching: the page may have reflowed, so re-measure rather
-            # than trusting a box from before whatever moved.
-            self._canvas, self._box = None, None
-            self.attach()
-        self._recompute_clip()
+        if region is not None:
+            self._measure_scale()
+
+    def _measure_scale(self) -> None:
+        """Frame pixels per CSS pixel.
+
+        A frame comes back at the display's real resolution, so on a HiDPI screen
+        it is twice the size the mouse works in. Detection does not care — it
+        finds the panel at whatever scale it is drawn — but clicking does.
+        """
+        if self._frame_size is None:
+            return
+        try:
+            w, _h = self._page.evaluate(self._VIEW_JS)
+        except Exception:
+            return
+        if w:
+            self._scale = self._frame_size[0] / float(w)
 
     # -- acting ---------------------------------------------------------------
     def click(self, x: int, y: int) -> None:
         """Click a point in the current frame. Never scrolls to reach it."""
-        if self._box is None:
-            raise BrowserError("no canvas attached, so there is nothing to click on")
-        ox, oy = self._box["px"], self._box["py"]
+        fx, fy = float(x), float(y)
         if self._region is not None:
-            ox += self._region.x
-            oy += self._region.y
-        # The mouse works in viewport coordinates and the box is in page
-        # coordinates, so this reads the scroll position rather than assuming it.
-        # Clicks are rare enough that the round trip does not matter.
-        view = self._page.evaluate(self._VIEW_JS)
-        self._page.mouse.click(ox + x - view["x"], oy + y - view["y"])
+            fx += self._region.x
+            fy += self._region.y
+        self._page.mouse.click(fx / self._scale, fy / self._scale)
 
     # -- the emulator ---------------------------------------------------------
     def trouble(self) -> str | None:
@@ -437,17 +351,26 @@ class PlaywrightBackend:
 
     def reload(self, timeout_ms: int = 90_000) -> None:
         """Start the page over. The game restarts, so you pick the mode again."""
-        self._canvas, self._box, self._region = None, None, None
+        self._region = None
+        self._frame_b64, self._frame_seq, self._taken_seq = None, 0, -1
         self._page.goto(self.url, timeout=timeout_ms, wait_until="domcontentloaded")
+        self._cdp.send("Page.startScreencast",
+                       {"format": "png", "maxWidth": 8000, "maxHeight": 8000, "everyNthFrame": 1})
 
     # -- diagnosis ------------------------------------------------------------
+    @property
+    def canvas_size(self) -> tuple[int, int] | None:
+        """The game canvas, if one can be found. Diagnostics only."""
+        try:
+            info = self._page.evaluate(self._INVENTORY_JS)
+        except Exception:
+            return None
+        c = info.get("canvas")
+        return None if c is None else (int(c["w"]), int(c["h"]))
+
     def describe_page(self) -> str:
-        """What is actually on the page. Used when the canvas never turns up."""
-        lines = [
-            f"the RideControl panel was not found at {self.url}"
-            if self._box is not None
-            else f"no game canvas at {self.url}"
-        ]
+        """What is actually on the page. Used when the panel never turns up."""
+        lines = [f"the RideControl panel was not found at {self.url}"]
         try:
             info = self._page.evaluate(self._INVENTORY_JS)
             lines.append(f"page title: {info.get('title')!r}")
@@ -458,33 +381,42 @@ class PlaywrightBackend:
             )
             if info.get("text"):
                 lines.append(f"page text: {info['text'][:200]!r}")
+            c, view = info.get("canvas"), info.get("view") or {}
+            if c and view:
+                below = c["y"] + c["h"] - view.get("h", 0)
+                right = c["x"] + c["w"] - view.get("w", 0)
+                lines.append(
+                    f"canvas is {int(c['w'])}x{int(c['h'])} at ({int(c['x'])}, {int(c['y'])}) "
+                    f"in a {int(view.get('w', 0))}x{int(view.get('h', 0))} window"
+                )
+                if below > 1 or right > 1:
+                    lines.append(
+                        "part of the game is outside the window, and this bot will not "
+                        "scroll or resize your page to reach it. Enlarge the window, or "
+                        "scroll the RideControl panel into view yourself."
+                    )
         except Exception as exc:
             lines.append(f"(could not inspect the page: {exc})")
         lines.append(f"frames: {[f.url for f in self._page.frames]}")
-        if self._box is not None:
-            seen = self.visible_fraction()
-            lines.append(
-                f"canvas is {int(self._box['w'])}x{int(self._box['h'])}, "
-                f"{seen:.0%} of it on screen"
-            )
-            if seen < 0.99:
-                lines.append(
-                    "part of the game is outside the window, and this bot will not "
-                    "scroll your page to reach it. Enlarge the window or scroll the "
-                    "RideControl panel into view yourself."
-                )
-        if self.debug_dir:
+        lines.append(f"screencast frames received: {self._frame_seq}")
+        if self.debug_dir and self._frame_b64:
             try:
                 self.debug_dir.mkdir(parents=True, exist_ok=True)
                 shot = self.debug_dir / f"page-{int(time.time())}.png"
-                self._page.screenshot(path=str(shot), full_page=True)
-                lines.append(f"screenshot: {shot}")
+                shot.write_bytes(base64.b64decode(self._frame_b64))
+                lines.append(f"last frame saved to: {shot}")
             except Exception:
                 pass
         lines.append("Run `python -m tools.probe_page` to watch the page load.")
         return "\n  ".join(lines)
 
     def close(self) -> None:
+        cdp = getattr(self, "_cdp", None)
+        if cdp is not None:
+            try:
+                cdp.send("Page.stopScreencast")
+            except Exception:
+                pass
         for attr in ("_browser", "_pw"):
             obj = getattr(self, attr, None)
             if obj is None:
