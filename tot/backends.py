@@ -1,26 +1,36 @@
 """Where frames come from and where clicks go.
 
-Three implementations behind one small protocol:
+``PlaywrightBackend``  the real thing — drives its own Chromium and screenshots a
+                       clipped rectangle of the page.
+``ImageBackend``       serves a PNG as "the current frame", so the whole stack runs
+                       with no browser. That is how the fixture tests work.
 
-``PlaywrightBackend``  the real thing — drives its own Chromium and talks to the
-                      game canvas directly, so coordinates are canvas-relative and
-                      the physical mouse is never touched.
-``ImageBackend``       serves a PNG as "the current frame". Runs the entire stack
-                      with no browser, which is how the fixture tests work.
-``DesktopBackend``     fallback that screenshots the display and moves the real
-                      mouse, for when driving the page from code is not an option.
+Two things make the live backend fast, and both are about *not capturing pixels*:
+
+1. Once the panel has been located, ``set_region`` clips every subsequent
+   screenshot to it. Capturing the whole canvas costs ~85 ms; the panel crop costs
+   ~19 ms, and the pixels outside it were never read.
+2. Chromium is launched with ``--disable-frame-rate-limit``. Without it a
+   screenshot waits for the compositor's next 30 Hz frame, which by itself put a
+   ~33 ms floor under every capture regardless of size.
+
+It also never clicks anything on its own. You load the game and pick the mode; the
+bot waits until it can see the RideControl panel. Blind click-to-play was both a
+way to lose your mode choice and a good way to upset the emulator.
 """
 
 from __future__ import annotations
 
 import io
+import json
 import time
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import numpy as np
 
-from .errors import BackendError
+from .errors import BrowserError, RuffleCrashed
+from .geometry import Rect
 
 DEFAULT_URL = (
     "https://www.themagical.nl/content/plugins/flash-emulator/"
@@ -34,8 +44,11 @@ class Backend(Protocol):
     def grab(self) -> np.ndarray:
         """The current frame as an (H, W, 3) uint8 RGB array."""
 
+    def set_region(self, region: Rect | None) -> None:
+        """Restrict later grabs to ``region`` of the current frame, or undo that."""
+
     def click(self, x: int, y: int) -> None:
-        """Click at a point in frame coordinates."""
+        """Click at a point in the *current* frame's coordinates."""
 
     def close(self) -> None: ...
 
@@ -54,28 +67,60 @@ class ImageBackend:
 
         self.path = Path(path)
         if not self.path.exists():
-            raise BackendError(f"no such fixture image: {self.path}")
-        self._frame = np.array(Image.open(self.path).convert("RGB"))
+            raise BrowserError(f"no such fixture image: {self.path}")
+        self._full = np.array(Image.open(self.path).convert("RGB"))
+        self._region: Rect | None = None
         self.clicks: list[tuple[int, int]] = []
 
     def grab(self) -> np.ndarray:
-        return self._frame
+        r = self._region
+        if r is None:
+            return self._full
+        return self._full[r.y : r.bottom, r.x : r.right]
+
+    def set_region(self, region: Rect | None) -> None:
+        self._region = region
 
     def click(self, x: int, y: int) -> None:
-        self.clicks.append((x, y))
+        r = self._region
+        self.clicks.append((x, y) if r is None else (x + r.x, y + r.y))
 
     def close(self) -> None:  # nothing to release
         pass
 
 
-class PlaywrightBackend:
-    """Drives Chromium and talks to the game's canvas element.
+#: Ruffle reads this before it boots. Everything here either removes an overlay
+#: that would sit on top of the panel, or removes a reason for Ruffle to give up
+#: mid-run — ``maxExecutionDuration`` in particular defaults to 15 seconds, after
+#: which a slow ActionScript frame is treated as a hang and the player panics.
+RUFFLE_CONFIG: dict[str, Any] = {
+    "autoplay": "on",
+    "unmuteOverlay": "hidden",
+    "splashScreen": False,
+    "warnOnUnsupportedContent": False,
+    "contextMenu": False,
+    "showSwfDownload": False,
+    "maxExecutionDuration": 3600,
+    "logLevel": "error",
+}
 
-    The canvas bounding box is the only calibration this needs: frames come from
-    ``element.screenshot()`` and clicks are dispatched at canvas-relative
-    coordinates, so window position, page scroll and display scaling are all
-    irrelevant, and a long run never fights the user for the mouse.
-    """
+#: Flags that matter, and why:
+#:   frame-rate-limit  a capped compositor puts a 33 ms floor under every capture
+#:   backgrounding     a window that loses focus otherwise gets throttled to 1 Hz
+#:   mute-audio        the game's sound is pure cost to us, and muting it also
+#:                     stops Ruffle wanting a click to unmute
+_CHROME_ARGS = (
+    "--mute-audio",
+    "--autoplay-policy=no-user-gesture-required",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-features=CalculateNativeWinOcclusion",
+)
+
+
+class PlaywrightBackend:
+    """Drives Chromium and screenshots a rectangle of the page."""
 
     #: Walks open shadow roots, because Ruffle mounts its canvas inside a
     #: <ruffle-player> custom element rather than in the light DOM.
@@ -105,6 +150,30 @@ class PlaywrightBackend:
     }
     """
 
+    #: Ruffle renders its failures into its own shadow root: #panic for a hard
+    #: crash, #message-overlay for the softer "this content is not supported"
+    #: banner. Both cover the panel, so both end the run rather than being read
+    #: as a strange-looking game.
+    _TROUBLE_JS = r"""
+    () => {
+      let hit = null;
+      const visit = (root) => {
+        let els;
+        try { els = root.querySelectorAll('*'); } catch (e) { return; }
+        for (const el of els) {
+          const id = (el.id || '').toLowerCase();
+          if (!hit && (id === 'panic' || id === 'message-overlay' ||
+                       id === 'panic-body' || id === 'error')) {
+            hit = (el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 400) || id;
+          }
+          if (el.shadowRoot) visit(el.shadowRoot);
+        }
+      };
+      visit(document);
+      return hit;
+    }
+    """
+
     _INVENTORY_JS = r"""
     () => {
       const inv = {};
@@ -129,47 +198,71 @@ class PlaywrightBackend:
     }
     """
 
-    #: Things a Flash-emulator page tends to put in front of the player.
-    _PLAY_SELECTORS = (
-        "ruffle-player", "#play", ".play", "#start", ".start",
-        "[class*='play']", "[id*='play']", "button",
-    )
+    _BOX_JS = r"""
+    (el) => {
+      const r = el.getBoundingClientRect();
+      return {vx: r.left, vy: r.top, px: r.left + window.scrollX,
+              py: r.top + window.scrollY, w: r.width, h: r.height};
+    }
+    """
 
     def __init__(
         self,
         url: str = DEFAULT_URL,
         headless: bool = False,
-        viewport: tuple[int, int] = (1600, 1000),
+        viewport: tuple[int, int] = (1400, 900),
         timeout_ms: int = 90_000,
-        click_to_play: bool = True,
         min_canvas_px: int = 100_000,
-        debug_dir: str | Path | None = "verify_layout_output",
+        uncapped_capture: bool = True,
+        ruffle_config: dict[str, Any] | None = None,
+        debug_dir: str | Path | None = "debug_output",
     ):
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:  # pragma: no cover - depends on the host
-            raise BackendError(
+            raise BrowserError(
                 "playwright is not installed. Run:\n"
                 "    pip install playwright && playwright install chromium"
             ) from exc
 
+        self.url = url
         self.min_canvas_px = min_canvas_px
         self.debug_dir = Path(debug_dir) if debug_dir else None
+        self._region: Rect | None = None
+        self._canvas: Any = None
+        self._box: dict[str, float] | None = None
+
+        args = list(_CHROME_ARGS)
+        if uncapped_capture:
+            args += ["--disable-frame-rate-limit", "--disable-gpu-vsync"]
+
         self._pw = sync_playwright().start()
         try:
-            self._browser = self._pw.chromium.launch(headless=headless)
+            self._browser = self._pw.chromium.launch(headless=headless, args=args)
             self._page = self._browser.new_page(
                 viewport={"width": viewport[0], "height": viewport[1]}
             )
+            cfg = json.dumps({**RUFFLE_CONFIG, **(ruffle_config or {})})
+            self._page.add_init_script(
+                "window.RufflePlayer = window.RufflePlayer || {};"
+                "window.RufflePlayer.config = Object.assign("
+                f"{{}}, window.RufflePlayer.config || {{}}, {cfg});"
+            )
             self._page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
-            self._canvas = self._await_canvas(timeout_ms, click_to_play)
         except Exception:
             self.close()
             raise
 
-    def _search_frames(self):
-        """Largest player-ish element across every frame, or None."""
-        best, best_area = None, -1
+    # -- attaching ------------------------------------------------------------
+    def attach(self) -> bool:
+        """Try to find the player canvas. Safe to call repeatedly.
+
+        Returns False rather than raising while the emulator is still starting —
+        the caller is in a wait loop, not an error path.
+        """
+        if self._canvas is not None and self._box is not None:
+            return True
+        best, area = None, -1.0
         for frame in self._page.frames:
             try:
                 el = frame.evaluate_handle(self._FIND_JS).as_element()
@@ -178,71 +271,78 @@ class PlaywrightBackend:
             if el is None:
                 continue
             box = el.bounding_box()
-            area = box["width"] * box["height"] if box else 0
-            if area > best_area:
-                best, best_area = el, area
-        return best, best_area
-
-    def _try_click_play(self) -> bool:
-        """Click whatever looks like a start affordance. Ruffle often will not
-        create its canvas until the splash is dismissed."""
-        for sel in self._PLAY_SELECTORS:
-            for frame in self._page.frames:
-                try:
-                    el = frame.query_selector(sel)
-                    if el is None:
-                        continue
-                    box = el.bounding_box()
-                    if box and box["width"] > 80 and box["height"] > 40:
-                        el.click(timeout=2000)
-                        return True
-                except Exception:
-                    continue
-        try:  # last resort: the middle of the page
-            self._page.mouse.click(
-                self._page.viewport_size["width"] // 2, self._page.viewport_size["height"] // 2
-            )
-            return True
-        except Exception:
+            a = box["width"] * box["height"] if box else 0.0
+            if a > area:
+                best, area = el, a
+        if best is None or area < self.min_canvas_px:
             return False
+        try:
+            best.scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
+        self._canvas = best
+        self._box = self._page.evaluate(self._BOX_JS, best)
+        return True
 
-    def _await_canvas(self, timeout_ms: int, click_to_play: bool):
-        """Poll until the player canvas exists and has real size.
+    @property
+    def canvas_size(self) -> tuple[int, int] | None:
+        return None if self._box is None else (int(self._box["w"]), int(self._box["h"]))
 
-        A Flash emulator has to download and start a whole game, which takes far
-        longer than a page load, and the canvas may not exist at all until a
-        splash screen is dismissed. So this polls for the full timeout and tries
-        clicking a start affordance along the way, rather than looking once.
-        """
-        started = time.monotonic()
-        deadline = started + timeout_ms / 1000
-        next_click = started + 4.0
-        best_area_seen = 0
-        while time.monotonic() < deadline:
-            el, area = self._search_frames()
-            best_area_seen = max(best_area_seen, int(area))
-            if el is not None and area >= self.min_canvas_px:
-                if click_to_play:
-                    try:
-                        el.click(timeout=3000)
-                        self._page.wait_for_timeout(1500)
-                    except Exception:
-                        pass
-                return el
-            if click_to_play and time.monotonic() >= next_click:
-                self._try_click_play()
-                next_click = time.monotonic() + 10.0
-            self._page.wait_for_timeout(500)
+    # -- frames ---------------------------------------------------------------
+    def _clip(self) -> dict[str, float]:
+        """The rectangle to capture, in page coordinates."""
+        if self._box is None:
+            vp = self._page.viewport_size or {"width": 1400, "height": 900}
+            return {"x": 0.0, "y": 0.0, "width": float(vp["width"]), "height": float(vp["height"])}
+        ox, oy = self._box["px"], self._box["py"]
+        w, h = self._box["w"], self._box["h"]
+        if self._region is not None:
+            r = self._region
+            return {"x": ox + r.x, "y": oy + r.y, "width": float(r.w), "height": float(r.h)}
+        return {"x": ox, "y": oy, "width": w, "height": h}
 
-        raise BackendError(self._diagnose(best_area_seen, timeout_ms))
+    def grab(self) -> np.ndarray:
+        self.attach()
+        return _png_to_array(self._page.screenshot(clip=self._clip()))
 
-    def _diagnose(self, best_area_seen: int, timeout_ms: int) -> str:
-        """Say what was actually on the page, and leave a screenshot behind."""
-        lines = [
-            f"could not find the game canvas after {timeout_ms / 1000:.0f}s.",
-            f"largest player-ish element seen was {best_area_seen} px "
-            f"(need {self.min_canvas_px}).",
-        ]
+    def set_region(self, region: Rect | None) -> None:
+        if region is not None and self._box is None:
+            raise BrowserError("cannot clip to the panel before the canvas is attached")
+        self._region = region
+
+    # -- acting ---------------------------------------------------------------
+    def click(self, x: int, y: int) -> None:
+        if self._box is None:
+            raise BrowserError("no canvas attached, so there is nothing to click on")
+        ox, oy = self._box["vx"], self._box["vy"]
+        if self._region is not None:
+            ox += self._region.x
+            oy += self._region.y
+        self._page.mouse.click(ox + x, oy + y)
+
+    # -- the emulator ---------------------------------------------------------
+    def trouble(self) -> str | None:
+        """Ruffle's own error text, if it is showing an error screen."""
+        try:
+            return self._page.evaluate(self._TROUBLE_JS)
+        except Exception:
+            return None
+
+    def check(self) -> None:
+        """Raise if the emulator has died. Cheap enough to call between ticks."""
+        msg = self.trouble()
+        if msg:
+            raise RuffleCrashed(f"the Flash emulator gave up: {msg}")
+
+    def reload(self, timeout_ms: int = 90_000) -> None:
+        """Start the page over. The game restarts, so you pick the mode again."""
+        self._canvas, self._box, self._region = None, None, None
+        self._page.goto(self.url, timeout=timeout_ms, wait_until="domcontentloaded")
+
+    # -- diagnosis ------------------------------------------------------------
+    def describe_page(self) -> str:
+        """What is actually on the page. Used when the canvas never turns up."""
+        lines = [f"no game canvas at {self.url}"]
         try:
             info = self._page.evaluate(self._INVENTORY_JS)
             lines.append(f"page title: {info.get('title')!r}")
@@ -259,26 +359,13 @@ class PlaywrightBackend:
         if self.debug_dir:
             try:
                 self.debug_dir.mkdir(parents=True, exist_ok=True)
-                shot = self.debug_dir / "canvas-not-found.png"
+                shot = self.debug_dir / f"page-{int(time.time())}.png"
                 self._page.screenshot(path=str(shot), full_page=True)
-                lines.append(f"screenshot of what was on screen: {shot}")
+                lines.append(f"screenshot: {shot}")
             except Exception:
                 pass
-        lines.append("Run `python -m tools.probe_page` to watch the page load interactively.")
+        lines.append("Run `python -m tools.probe_page` to watch the page load.")
         return "\n  ".join(lines)
-
-    @property
-    def canvas_size(self) -> tuple[int, int]:
-        box = self._canvas.bounding_box()
-        if box is None:
-            raise BackendError("the game canvas is no longer on the page")
-        return int(box["width"]), int(box["height"])
-
-    def grab(self) -> np.ndarray:
-        return _png_to_array(self._canvas.screenshot())
-
-    def click(self, x: int, y: int) -> None:
-        self._canvas.click(position={"x": float(x), "y": float(y)})
 
     def close(self) -> None:
         for attr in ("_browser", "_pw"):
@@ -289,47 +376,3 @@ class PlaywrightBackend:
                 obj.close() if attr == "_browser" else obj.stop()
             except Exception:
                 pass
-
-
-class DesktopBackend:
-    """Screenshots the display and moves the real mouse.
-
-    A fallback for when the page cannot be driven from code. It costs you the
-    mouse for the length of the run and needs the game window left alone, so
-    prefer PlaywrightBackend unless that is impossible.
-    """
-
-    def __init__(self, region: tuple[int, int, int, int] | None = None):
-        try:
-            import mss  # noqa: F401
-            import pyautogui  # noqa: F401
-        except ImportError as exc:  # pragma: no cover - depends on the host
-            raise BackendError(
-                "the desktop backend needs `pip install mss pyautogui`"
-            ) from exc
-        import mss
-
-        self._sct = mss.mss()
-        self.region = region
-
-    def grab(self) -> np.ndarray:
-        mon = self._sct.monitors[1] if self.region is None else {
-            "left": self.region[0],
-            "top": self.region[1],
-            "width": self.region[2],
-            "height": self.region[3],
-        }
-        shot = self._sct.grab(mon)
-        return np.array(shot)[:, :, [2, 1, 0]]  # BGRA -> RGB
-
-    def click(self, x: int, y: int) -> None:
-        import pyautogui
-
-        ox, oy = (self.region[0], self.region[1]) if self.region else (0, 0)
-        pyautogui.click(ox + x, oy + y)
-
-    def close(self) -> None:
-        try:
-            self._sct.close()
-        except Exception:
-            pass

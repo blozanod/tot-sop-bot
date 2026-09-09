@@ -1,66 +1,44 @@
-"""Failure modes.
-
-Every error here exists because the alternative was a silent misread. The bot is
-calibrated from screenshots rather than from the live game, so drift between what
-was measured and what is on screen must surface as a crash, never as a plausible
-state.
-"""
+"""Failures the bot can hit, each with a name that says what to do about it."""
 
 from __future__ import annotations
 
 
 class TotError(Exception):
-    """Base for everything this package raises."""
+    """Base class for everything this package raises."""
 
 
-class LayoutError(TotError):
-    """The RideControl panel could not be located, or is not the shape we expect.
+class PanelError(TotError):
+    """The RideControl panel is not on screen, or is not the shape we expect.
 
-    Raised at calibration. Usually means the frame is not the playing field (a
-    chooser or loading screen), or the panel is partly off-screen.
+    Raised while looking for the panel (which is normal — that is how the bot
+    waits for you to start a game) and when reading from a frame that has none.
     """
 
 
 class UnknownColorError(TotError):
-    """A probed button is a colour that is not in the palette at all.
+    """A button is showing a fill that is not in the palette."""
 
-    Almost always a real find: a game state that was never captured in the
-    calibration screenshots. Add it to ``colors.PALETTE`` and give it a meaning in
-    ``states.py``.
-    """
-
-    def __init__(self, button: str, rgb: tuple[int, int, int], nearest: str, distance: float):
-        self.button, self.rgb, self.nearest, self.distance = button, rgb, nearest, distance
+    def __init__(self, key: str, rgb: tuple[int, int, int], votes: int):
+        self.key, self.rgb, self.votes = key, rgb, votes
+        r, g, b = rgb
         super().__init__(
-            f"{button}: sampled #{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x} which is not in the "
-            f"palette (nearest is {nearest}, distance {distance:.1f}). "
-            f"Either the layout has drifted or this is a state we never captured."
+            f"{key} is #{r:02x}{g:02x}{b:02x}, which is not a palette colour "
+            f"({votes} of 9 probes agreed). Either the panel has moved under the "
+            f"probe points or this is a fill the calibration never saw."
         )
 
 
 class UnmappedStateError(TotError):
-    """A known palette colour appeared on a button that has no meaning for it.
+    """A button is a palette colour that has no meaning on *that* button."""
 
-    Distinct from UnknownColorError: the colour is real, we just never saw this
-    button wear it. Add the mapping in ``states.py``.
-    """
-
-    def __init__(self, button: str, color_name: str, known: list[str]):
-        self.button, self.color_name = button, color_name
-        super().__init__(
-            f"{button} is {color_name}, which is not one of its known states "
-            f"({', '.join(known)}). This is a state the calibration screenshots "
-            f"never showed; add it to states.py."
-        )
+    def __init__(self, key: str, color: str, known: list[str]):
+        self.key, self.color, self.known = key, color, known
+        super().__init__(f"{key} is {color}, which maps to no state. Known: {', '.join(known)}")
 
 
-class DigitError(TotError):
-    """A counter could not be read confidently."""
+class BrowserError(TotError):
+    """The browser or the Flash emulator could not be brought up."""
 
 
-class NotPlayingError(TotError):
-    """A game observable was read while the canvas was not showing the playing field."""
-
-
-class BackendError(TotError):
-    """The browser, display or fixture image could not be driven."""
+class RuffleCrashed(BrowserError):
+    """Ruffle threw up its error screen. The run cannot continue on this page."""

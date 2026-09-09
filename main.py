@@ -1,165 +1,120 @@
 """Your strategy goes here.
 
-Everything below the setup block is a skeleton. The classes deliberately contain
-no decisions: every property is one thing on screen, so every branch you write
-here maps to one instruction a person can follow.
-
     python main.py
 
-Read `game.describe()` or the JSONL trace in logs/ to see what the bot saw.
+The bot opens the page and then waits. **You** load the game and pick the mode —
+it will not touch anything. The moment the RideControl panel appears on screen the
+game has begun, ``wait_for_panel()`` returns, and the loop below starts.
+
+Everything below the setup block is a skeleton. The classes deliberately contain
+no decisions: every property is one thing on screen, so every branch you write
+here maps to one instruction a person could follow.
 """
 
 from __future__ import annotations
-import time
 
-from tot import Game, Screen
+from tot import DEFAULT_URL, Game, RuffleCrashed
 
 # The Simulation Page only offers the Unlimited game. Point this at the TM Arcade
-# URL when you want the timed, scored 12-hour run.
-URL = None  # None uses tot.DEFAULT_URL
-
-# game.tv_room1 / game.tv_room2   (TV Room 1 & 2)
-#   Read:
-#     waiting, loaded                                   # counters
-#     load_button, unload_button, entrance, exit,
-#     enable_button, preshow                             # raw states
-#     can_load, is_loading, unload_ready, is_unloading,
-#     entrance_is_closed / _moving / _open,
-#     exit_is_closed / _moving / _open,
-#     enabled, preshow_ready, preshow_running             # booleans
-#   Click:
-#     load(), unload(), start_preshow(), toggle_enabled()
-
-# game.elevator1 / elevator2 / elevator3
-#   Read:
-#     waiting, loaded
-#     enable_button, doors, load_button, dispatch_button  # raw states
-#     enabled, doors_are_closed / _moving / _open,
-#     can_load, is_loading, can_dispatch, is_dispatched    # booleans
-#   Click:
-#     load(), dispatch(), toggle_enabled(), toggle_doors()
-
-# game.track
-#   Read only (no buttons — shared shaft status):
-#     state, is_ready, is_locked
-
-# game.control   (global RideControl panel)
-#   Read:
-#     front_waiting, back_waiting, visitor_counter         # counters
-#     attraction, attraction_is_active, attraction_is_closed
-#     automatic_doors / automatic_doors_on
-#     daytime / daytime_on
-#     show_fullscreen
-#     ride_sfx / ride_sfx_on
-#     tv_room_sound / tv_room_sound_on
-#     bgm / bgm_on
-#   Click:
-#     toggle_attraction(), toggle_automatic_doors(), toggle_daytime(),
-#     toggle_show_fullscreen(), toggle_ride_sfx(),
-#     toggle_tv_room_sound(), toggle_bgm()
-
-# game   (top level)
-#   Read:
-#     clock, score, screen
-#   Actions:
-#     refresh()                       # take one screenshot/frame
-#     wait_until(predicate, timeout=30.0, poll=0.1)
-#     describe() / snapshot()         # debugging dumps
+# URL when you want the timed, scored run.
+URL = DEFAULT_URL
 
 # --------------------------------------------------------------------------
-# All clickable buttons, tallied:
-#   TV rooms   (x2): load, unload, start_preshow, toggle_enabled     -> 8 buttons
-#   Elevators  (x3): load, dispatch, toggle_enabled, toggle_doors    -> 12 buttons
-#   Global     (x1): toggle_attraction, toggle_automatic_doors,
-#                     toggle_daytime, toggle_show_fullscreen,
-#                     toggle_ride_sfx, toggle_tv_room_sound,
-#                     toggle_bgm                                      -> 7 buttons
+# What is readable, in full.
 #
-# Track and all counters (waiting/loaded/score/clock/visitor counts)
-# are read-only — not clickable.
+# game.tv_room1 / game.tv_room2
+#   States:  load_button unload_button entrance exit enable_button preshow
+#   Booleans: can_load is_loading unload_ready is_unloading
+#             entrance_is_closed/_moving/_open  exit_is_closed/_moving/_open
+#             enabled preshow_ready preshow_running
+#   Counters: waiting loaded                       -> Count.ZERO / FULL / OTHER
+#             waiting_is_zero waiting_is_full loaded_is_zero loaded_is_full
+#   Clicks:   load() unload() start_preshow() toggle_enabled()
+#
+# game.elevator1 / elevator2 / elevator3
+#   States:   enable_button doors load_button dispatch_button
+#   Booleans: enabled doors_are_closed/_moving/_open
+#             can_load is_loading can_dispatch is_dispatched
+#   Counters: waiting loaded (+ the four booleans, as above)
+#   Clicks:   load() dispatch() toggle_enabled() toggle_doors()
+#
+# game.track       state is_ready is_locked           (read-only)
+# game.control     attraction attraction_is_active/_closed
+#                  front_waiting back_waiting front_queue_is_full back_queue_is_full
+#                  automatic_doors daytime ride_sfx tv_room_sound bgm
+#                  toggle_attraction() toggle_automatic_doors() toggle_daytime()
+#                  toggle_show_fullscreen() toggle_ride_sfx()
+#                  toggle_tv_room_sound() toggle_bgm()
+# game             refresh() wait_until(pred, timeout) describe() panel_visible
+#
+# A counter only ever says ZERO, FULL (21) or OTHER. Those are the two numbers a
+# decision turns on; every other value means "wait", and the bot does not spend a
+# frame working out which one it is.
+#
+# All 27 clickable buttons: 8 across the TV rooms, 12 across the elevators,
+# 7 on RideControl. Track and every counter are read-only.
+# --------------------------------------------------------------------------
+
+
+def play(game: Game) -> None:
+    """One pass of your strategy. Called in a loop, once per frame.
+
+    ``game`` has already been refreshed, so every property below describes the
+    same instant. Do not refresh in here.
+    """
+    # Open the attraction, once.
+    if not game.control.attraction_is_active:
+        game.control.toggle_attraction()
+        return
+
+    # ------------------------------------------------------------------
+    # Strategy starts here. A rule is one observable and one click:
+    #
+    #     for room in game.tv_rooms.values():
+    #         if room.preshow_ready:            # Start Preshow has turned orange
+    #             room.start_preshow()
+    #         elif room.unload_ready:           # Unload has turned orange
+    #             room.unload()
+    #         elif room.can_load and room.waiting_is_full:
+    #             room.load()                   # a full 21 are queued
+    #
+    #     for lift in game.elevators.values():
+    #         if lift.can_dispatch and not game.track.is_locked:
+    #             lift.dispatch()
+    #         elif lift.can_load and not lift.waiting_is_zero:
+    #             lift.load()
+    # ------------------------------------------------------------------
 
 
 def main() -> None:
     game = Game.launch(
-        url=URL or __import__("tot").DEFAULT_URL,
+        url=URL,
         headless=False,
-        trace="logs/run.jsonl",
-        # "raise" stops the run on any colour we have not seen before. Switch to
-        # "unknown" only once you trust the calibration.
+        # "raise" stops the run on a fill we have not seen before. There is no
+        # "guess" mode on purpose: a misread colour is a wrong decision.
         on_unknown="raise",
         # 0.0 lets the bot play as fast as it can. Set a floor (say 0.4) to find
         # out what the same strategy scores at human speed.
         min_click_interval=0.0,
     )
 
-    time.sleep(5)
-
     with game:
-        game.refresh()
-        if game.screen is not Screen.PLAYING:
-            print("Not on the playing field. Choose a game mode, then re-run.")
+        print("Load the game and pick your mode. I start when I can see the panel.")
+        if not game.wait_for_panel(timeout=600):
+            print("No RideControl panel after 10 minutes — giving up.")
             return
 
-        print(f"clock {game.clock}   score {game.score}")
-        for line in game.describe():
-            print(" ", line)
+        print(f"Panel found ({game.layout.region.w}x{game.layout.region.h} crop). Playing.")
+        try:
+            while game.refresh():
+                play(game)
+        except RuffleCrashed as exc:
+            print(f"\n{exc}\nReload the page and run again.")
+        except KeyboardInterrupt:
+            pass
 
-        if not game.control.attraction_is_active:
-            game.control.toggle_attraction()
-            game.wait_until(lambda: game.control.attraction_is_active, timeout=20, poll=0.5)
-
-        game.tv_room1.toggle_enabled()
-
-        while (game.tv_room1.waiting < 21):
-            game.refresh()
-
-        game.tv_room1.load()
-
-        time.sleep(10)
-
-        # ------------------------------------------------------------------
-        # Strategy starts here.
-        #
-        # A tick looks like:
-        #
-        #     game.refresh()                     # one screenshot, frozen
-        #     if game.tv_room1.preshow_ready:    # Start Preshow is orange
-        #         game.tv_room1.start_preshow()
-        #
-        # Useful shapes:
-        #
-        #     for lift in game.elevators.values():
-        #         if lift.can_dispatch and not game.track.is_locked:
-        #             lift.dispatch()
-        #
-        #     game.wait_until(lambda: game.tv_room1.unload_ready, timeout=60)
-        #
-        # Reference for what is readable:
-        #
-        #   tv_room1 / tv_room2   waiting loaded
-        #                         load_button unload_button entrance exit
-        #                         enable_button preshow
-        #                         can_load is_loading unload_ready is_unloading
-        #                         entrance_is_closed/_moving/_open
-        #                         exit_is_closed/_moving/_open
-        #                         enabled preshow_ready preshow_running
-        #                         load() unload() start_preshow() toggle_enabled()
-        #
-        #   elevator1/2/3         waiting loaded
-        #                         enable_button doors load_button dispatch_button
-        #                         enabled doors_are_closed/_moving/_open
-        #                         can_load is_loading can_dispatch is_dispatched
-        #                         load() dispatch() toggle_enabled() toggle_doors()
-        #
-        #   control               front_waiting back_waiting visitor_counter
-        #                         attraction attraction_is_active/_closed
-        #                         automatic_doors daytime show_fullscreen
-        #                         ride_sfx tv_room_sound bgm  (+ *_on aliases)
-        #                         toggle_attraction() toggle_*()
-        #
-        #   track                 state is_ready is_locked
-        #   game                  clock score screen refresh() wait_until()
-        # ------------------------------------------------------------------
+        if not game.panel_visible:
+            print("The panel went away — the game is over, or the emulator dropped it.")
 
 
 if __name__ == "__main__":

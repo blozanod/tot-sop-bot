@@ -7,9 +7,7 @@ venv/
 *.egg-info/
 
 # Run output
-logs/
-*.jsonl
-verify_layout_output/
+debug_output/
 
 # OS
 .DS_Store

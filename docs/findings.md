@@ -148,6 +148,14 @@ below it. Same guarantee as before (a bad read errors rather than lying), but
 tolerant of the rendering jitter that is actually present. See `design-decisions.md`
 (#4).
 
+> **Superseded on day two.** The bot no longer reads numbers — only whether a
+> counter says `0`, says `21`, or says something else, because those are the only
+> two values that change a decision (`design-decisions.md` #23). The correlation
+> matcher survives, but it runs against the counter font alone and only ever asks
+> "is this glyph a `0`?" or "is this `2` then `1`?". The HUD face is gone with the
+> clock and the score, which is also what let the screenshot shrink to the panel.
+> The measurements in this section stand; what was built on them changed.
+
 ---
 
 ## 6. The clock runs fast — about 1 virtual minute per real second

@@ -168,3 +168,102 @@ asserting a mechanism.
 **20. Build held until assets land.**
 No placeholder scaffolding. Everything gets written in one pass against real
 pixels once the screenshots and mechanics doc are in.
+
+---
+
+# Day two: what got cut, and why
+
+The first build read everything the screen offered and recorded all of it. That
+was the wrong instinct — it spent its budget on pixels and numbers that never
+changed a decision. These decisions replace the ones above where they conflict.
+
+**21. Stay in Python.**
+The obvious suspect for a 2-second tick was the language. It was not. Measuring
+the pieces:
+
+| | before | after |
+| --- | --- | --- |
+| locate the panel (full canvas) | 1520 ms | 77 ms |
+| decode one frame | 29 ms | 0.05 ms |
+| capture one frame | ~85 ms | ~19 ms |
+
+The two Python numbers fell by 20× and 600× without leaving Python, because the
+cost was never the interpreter — it was a per-row numpy call inside a loop over
+1198 rows, and `np.unique` sorting a patch to find a modal colour. Both are
+vectorised now.
+
+What is left is ~19 ms of screenshot, and that is Chromium's, reached over CDP.
+A rewrite in Rust or Go would be competing for the remaining 2 ms of a 21 ms tick
+and would still wait the same 19 ms for the browser. At ~47 Hz against a game
+that advances one game-minute per real second, perception is no longer the
+constraint — strategy is. Revisit only if the browser stops being the floor.
+
+**22. Screenshot the panel, not the canvas.**
+The panel is located once from a full frame; after that every capture is clipped
+to its bounding box, roughly an eighth of the canvas. This is the single biggest
+win in the whole loop — 85 ms → 19 ms — and everything outside that rectangle was
+being decoded and thrown away.
+
+Chromium is also launched with `--disable-frame-rate-limit`. Without it a
+screenshot waits for the compositor's next 30 Hz frame, which put a 33 ms floor
+under every capture *regardless of size* and hid the benefit of cropping.
+
+**23. Read 0 and 21. Nothing else.** *(Replaces #4's full digit reader.)*
+Those are the only two counter values that change what a player does: zero means
+there is nothing to move, 21 means a full load. Everything between them means
+wait. So a counter classifies three ways — `ZERO`, `FULL`, `OTHER` — and the
+short-circuits mean most boxes never reach the matcher at all: three or more
+glyphs is `OTHER` outright, and a two-glyph box whose first character is not `2`
+is `OTHER` without the second being looked at.
+
+The templates were rebuilt from the counter font only. Keeping the 29 px HUD face
+in the same table was a live hazard: a HUD exemplar labelled `0` sitting next to a
+counter `6` is exactly how a counter gets misread as empty.
+
+**24. Counters are lazy; buttons are eager.**
+All 32 button colours come from one vectorised read of 288 pixels, so reading
+them all is cheaper than deciding which ones to skip. Counters are the opposite —
+each is a segmentation — so they are read on first access and cached until the
+next `refresh()`. A tick that only asks about colours never touches a digit.
+
+**25. No clock, no score, no HUD.** *(Replaces part of #4 and #6.)*
+Neither number is an input to any decision. The score is an outcome, and the
+clock only says how long is left, which does not change what the right move is.
+Both lived outside the panel, so dropping them is also what let the crop shrink
+to the panel alone.
+
+**26. No trace.** *(Replaces #16 and #17.)*
+Every action and every state change was being written to JSONL, with a
+plain-English gloss per state, on a loop that now runs at 47 Hz. The glosses and
+the `verified` / `inferred` bookkeeping went with it. The trace was for drafting
+the procedure; that can be reintroduced as a strategy-level concern in `main.py`,
+recording the handful of decisions that matter rather than every frame.
+
+**27. The bot never clicks its way in.** *(Replaces #9 and #12.)*
+The old backend clicked play buttons, then the canvas, then the middle of the
+page, trying to get past a splash screen. That could land on the mode chooser and
+pick a game for you, and blind clicks into a half-loaded emulator are a fair
+suspect for the crashes.
+
+Now: it opens the page and waits. `wait_for_panel()` polls at 1 Hz until the
+32-button grid is on screen, and finding it *is* the signal that the game has
+started — which also retires `game.screen`, since "the panel is there" and "we
+are on the playing field" were always the same question.
+
+**28. Ruffle is configured, and its failures are detected.**
+`window.RufflePlayer.config` is injected before the emulator boots:
+`maxExecutionDuration` goes from 15 s to 3600 s (Ruffle panics when a frame
+exceeds it, which a long game plausibly does), and the unmute overlay, splash
+screen, unsupported-content warning and context menu are all turned off, since
+each one can cover the panel. Audio is muted at the browser level too — it is
+pure cost to us.
+
+If Ruffle does put up its error screen, `#panic` / `#message-overlay` in its
+shadow root is detected and raised as `RuffleCrashed` carrying Ruffle's own text,
+rather than the frame being read as a strange-looking game.
+
+> Unverified, and it has to be: the game is still not reachable from the machine
+> this was written on, so the config values and the panic selectors come from
+> Ruffle's documented interface rather than from watching your crash. If the
+> orange screen survives all this, `python -m tools.probe_page` prints the
+> emulator's error text — send it and this becomes a fix rather than a guess.
