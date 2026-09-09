@@ -267,3 +267,34 @@ rather than the frame being read as a strange-looking game.
 > Ruffle's documented interface rather than from watching your crash. If the
 > orange screen survives all this, `python -m tools.probe_page` prints the
 > emulator's error text — send it and this becomes a fix rather than a guess.
+
+**29. Nothing the bot does may move the page.**
+Cropping the screenshot was worth ~65 ms a tick, but the first version bought it
+by calling `scroll_into_view_if_needed()` once at startup: Playwright refuses a
+clip outside the viewport, so a canvas taller than the window had to be scrolled
+to before it could be captured. What that looks like from the outside is the view
+jumping to the control panel, which is not acceptable — you are watching the game.
+
+Measured, on a page whose canvas runs past the fold:
+
+| | off-screen clip | scroll events | resize events | cost |
+| --- | --- | --- | --- | --- |
+| `page.screenshot(clip=…)` | refuses | 0 | 0 | 18.8 ms |
+| CDP, `captureBeyondViewport: false` | blank | 0 | 0 | 12.7 ms |
+| CDP, `captureBeyondViewport: true` | correct | 0 | **1 per capture** | 14.3 ms |
+
+The third row is the trap: it reaches below the fold without scrolling, so it
+looks like the answer, but it fires a `resize` on the page for every single
+capture. At 51 Hz into an emulator that relays out its canvas on resize, that is
+both a visible twitch and a fair suspect for the crashes.
+
+So: capture through CDP with both flags false, and intersect the wanted rect with
+whatever is currently on screen. Off-screen means a short crop, which means the
+panel is not found, which means the bot waits and says why — never that it moves
+your page to reach it. The window is opened maximised (`--start-maximized` with
+no emulated viewport) so that case is rare to begin with.
+
+Two things fell out of it: the capture is 6 ms cheaper than Playwright's helper,
+which waits for fonts and hides text carets on every call, and clicks now read the
+scroll position instead of assuming it, so scrolling mid-run no longer aims them
+at the wrong place.

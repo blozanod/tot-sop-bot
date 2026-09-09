@@ -102,6 +102,7 @@ def main() -> None:
         print("Load the game and pick your mode. I start when I can see the panel.")
         if not game.wait_for_panel(timeout=600):
             print("No RideControl panel after 10 minutes — giving up.")
+            print(game.backend.describe_page())
             return
 
         print(f"Panel found ({game.layout.region.w}x{game.layout.region.h} crop). Playing.")
