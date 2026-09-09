@@ -45,6 +45,7 @@ class Game:
         backend: Backend,
         on_unknown: str = "raise",
         min_click_interval: float = 0.0,
+        reclick_after: float = 1.0,
         reader: CounterReader | None = None,
     ):
         if on_unknown not in ("raise", "ignore"):
@@ -52,7 +53,9 @@ class Game:
         self.backend = backend
         self.on_unknown = on_unknown
         self.min_click_interval = min_click_interval
+        self.reclick_after = reclick_after
         self._reader = reader
+        self._acted: dict[str, float] = {}
         self._layout: Layout | None = None
         self._frame: np.ndarray | None = None
         self._states: dict[str, Any] = {}
@@ -176,6 +179,10 @@ class Game:
                 raise UnmappedStateError(
                     key, color.name, [c.name for c in meanings(key)]
                 )
+            if self._states.get(key) is not state:
+                # The panel has answered for this button, so a press is allowed
+                # again — see _click.
+                self._acted.pop(key, None)
             self._states[key] = state
         return True
 
@@ -228,14 +235,33 @@ class Game:
         return Color(modal_rgb(self.frame, lay.probe_y[i], lay.probe_x[i]))
 
     # -- acting ---------------------------------------------------------------
-    def _click(self, key: str) -> None:
+    def _click(self, key: str) -> bool:
+        """Press a button, unless it has not yet answered the last press.
+
+        Returns False when the press was suppressed. A frame is a picture of the
+        past — it was painted before the last click reached the game — so a loop
+        that re-decides every 40 ms will keep pressing on the strength of a
+        reading that predates its own last action. On a toggle like Attraction
+        that means opening and closing the ride on alternate frames forever.
+
+        So a button is not pressed again while it still looks exactly as it did
+        when it was last pressed. The moment its colour moves, the press is
+        allowed again. ``reclick_after`` bounds the wait, so a click the game
+        simply dropped is retried rather than deadlocking that button; set it to
+        0 to turn the guard off entirely.
+        """
         self._require_panel()
+        if self.reclick_after and key in self._acted:
+            if time.monotonic() - self._acted[key] < self.reclick_after:
+                return False
         rect = self.layout.buttons[key]
         wait = self.min_click_interval - (time.monotonic() - self._last_click)
         if wait > 0:
             time.sleep(wait)
         self.backend.click(int(rect.cx), int(rect.cy))
         self._last_click = time.monotonic()
+        self._acted[key] = self._last_click
+        return True
 
     # -- waiting --------------------------------------------------------------
     def wait_until(

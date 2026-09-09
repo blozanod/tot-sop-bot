@@ -7,12 +7,13 @@ Playwright backend has to honour.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from tot import Game, PanelError, RuffleCrashed
+from tot import AttractionState, Game, PanelError, RuffleCrashed
 from tot.backends import ImageBackend, _to_array
 from tot.geometry import Rect
 
@@ -145,16 +146,20 @@ def test_no_region_means_the_whole_frame() -> None:
 class _Mouse:
     def __init__(self) -> None:
         self.clicks: list[tuple[float, float]] = []
+        self.moves: list[tuple[float, float]] = []
 
     def click(self, x: float, y: float) -> None:
         self.clicks.append((x, y))
 
+    def move(self, x: float, y: float) -> None:
+        self.moves.append((x, y))
 
-def _fake_live_backend(scale: float, region: Rect | None):
+
+def _fake_live_backend(scale: float, region: Rect | None, frame=(1600, 1000)):
     from tot.backends import PlaywrightBackend
 
     b = PlaywrightBackend.__new__(PlaywrightBackend)
-    b._region, b._scale = region, scale
+    b._region, b._scale, b._frame_size = region, scale, frame
     b._page = type("P", (), {"mouse": _Mouse()})()
     return b
 
@@ -171,3 +176,103 @@ def test_a_click_is_scaled_back_on_a_hidpi_frame() -> None:
     b = _fake_live_backend(2.0, Rect(200, 100, 900, 300))
     b.click(60, 40)
     assert b._page.mouse.clicks == [(130.0, 70.0)]
+
+
+def test_the_pointer_is_parked_off_the_panel_after_a_click() -> None:
+    """A button under the cursor may render its rollover state, and the bot
+    would then be reading a colour it caused itself."""
+    region = Rect(100, 50, 900, 300)
+    b = _fake_live_backend(1.0, region)
+    b.click(30, 20)
+    (px, py), = b._page.mouse.moves
+    assert not (region.x <= px < region.right and region.y <= py < region.bottom)
+
+
+def test_parking_stays_inside_the_frame_when_the_panel_is_at_the_top() -> None:
+    region = Rect(0, 0, 900, 300)
+    b = _fake_live_backend(1.0, region, frame=(1600, 1000))
+    b.click(5, 5)
+    (px, py), = b._page.mouse.moves
+    assert 0 <= px < 1600 and 0 <= py < 1000
+    assert not (region.x <= px < region.right and region.y <= py < region.bottom)
+
+
+def test_no_region_means_nowhere_to_park() -> None:
+    b = _fake_live_backend(1.0, None)
+    b.click(10, 10)
+    assert b._page.mouse.clicks == [(10.0, 10.0)]
+    assert b._page.mouse.moves == []
+
+
+# -- pressing a button the panel has not answered yet ------------------------
+
+class _Panel:
+    """A backend serving one fixture frame, so a real Game can be driven."""
+
+    def __init__(self) -> None:
+        from PIL import Image
+
+        self.full = np.array(Image.open(FRAME).convert("RGB"))
+        self.region: Rect | None = None
+        self.clicks: list[tuple[int, int]] = []
+
+    def grab(self) -> np.ndarray:
+        r = self.region
+        return self.full if r is None else self.full[r.y : r.bottom, r.x : r.right]
+
+    def set_region(self, region: Rect | None) -> None:
+        self.region = region
+
+    def click(self, x: int, y: int) -> None:
+        self.clicks.append((x, y))
+
+    def close(self) -> None:
+        pass
+
+
+def test_a_button_is_not_pressed_again_until_the_panel_answers() -> None:
+    """The frame the bot decides from was painted before its last click landed.
+    Without this, a toggle flips on every tick, forever."""
+    g = Game(_Panel())
+    assert g.refresh()
+    assert g.control.toggle_attraction() is True
+    for _ in range(20):
+        g.refresh()                       # the fixture never changes: no answer
+        assert g.control.toggle_attraction() is False
+    assert len(g.backend.clicks) == 1
+
+
+def test_the_press_is_allowed_again_once_the_colour_moves() -> None:
+    g = Game(_Panel())
+    g.refresh()
+    assert g.control.toggle_attraction() is True
+    # pretend the panel answered: the button is now a different state
+    g._states["control.attraction"] = AttractionState.CLOSED
+    g._acted.pop("control.attraction", None)
+    assert g.control.toggle_attraction() is True
+    assert len(g.backend.clicks) == 2
+
+
+def test_a_dropped_click_is_retried_rather_than_deadlocking() -> None:
+    """If the game simply ignores a click, the button must not be stuck for good."""
+    g = Game(_Panel(), reclick_after=0.05)
+    g.refresh()
+    assert g.tv_room1.load() is True
+    assert g.tv_room1.load() is False
+    time.sleep(0.06)
+    assert g.tv_room1.load() is True
+
+
+def test_the_guard_can_be_turned_off() -> None:
+    g = Game(_Panel(), reclick_after=0.0)
+    g.refresh()
+    assert g.elevator1.dispatch() is True
+    assert g.elevator1.dispatch() is True
+
+
+def test_the_guard_is_per_button() -> None:
+    g = Game(_Panel())
+    g.refresh()
+    assert g.tv_room1.load() is True
+    assert g.tv_room2.load() is True, "a press on one button must not gag another"
+    assert g.tv_room1.load() is False

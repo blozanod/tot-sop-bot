@@ -50,7 +50,7 @@ Write your strategy in [`main.py`](main.py); it lists the full readable surface.
 | **Stays out of the way** | Never clicks, scrolls or resizes on its own, and never asks the browser for a screenshot. Your view of the game does not move or flicker while it plays — see below. |
 | **Classifies** | Eight exact flat fills. All 32 buttons are read in one vectorised majority vote over 288 probe pixels — 0.05 ms. |
 | **Counts** | Only **0** and **21**. Every other value is `OTHER`, because every other value means the same thing: wait. Counters are read lazily, so a tick that only looks at colours never touches a digit. |
-| **Acts** | Clicks and nothing else — no precondition checks, no waiting for animations. That is your job. |
+| **Acts** | Clicks and nothing else — no precondition checks, no waiting for animations. That is your job. The one thing it will not do is press a button the panel has not answered yet: see below. |
 
 ### What it costs
 
@@ -93,6 +93,36 @@ what you are trying to watch.
 
 If the panel is off the bottom of the window it simply is not found, the bot keeps
 waiting, and it tells you to enlarge the window or scroll it into view yourself.
+
+### It presses once per cue, not once per frame
+
+A frame is a picture of the past — it was painted before your last click reached
+the game. So a loop that re-decides every 40 ms keeps acting on a reading that
+predates its own last action, and on a toggle that means opening and closing the
+ride on alternate frames, forever.
+
+Two things stop it, and **neither is sufficient alone**. Measured against a fake
+panel with a 250 ms response and a rollover on the button, over four seconds:
+
+| | ride toggled |
+| --- | --- |
+| neither | 63 times (once per tick) |
+| pointer parked off the panel | 36 times |
+| press guard only | 4 times |
+| **both** | **once** |
+
+* **The pointer is parked off the panel after every click.** A button under the
+  cursor may render its rollover state, and the bot would be reading a colour it
+  caused itself. `Attraction` is the one that cannot survive that: it is the only
+  button whose two states differ by brightness alone — `#ffffff` active against
+  `#cccccc` closed — rather than by hue, so anything that dims it reads as
+  "closed", and the answer to "closed" is to press it again.
+* **A button is not pressed again while it looks exactly as it did when it was
+  last pressed.** The moment its colour moves, pressing is allowed again.
+  `reclick_after` (default 1 s) bounds the wait so a click the game dropped is
+  retried rather than deadlocking that button; set it to `0` to disable.
+
+Every action returns `True` if it pressed and `False` if it was suppressed.
 
 ### One property, one observable
 

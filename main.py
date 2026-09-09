@@ -62,7 +62,11 @@ def play(game: Game) -> None:
     ``game`` has already been refreshed, so every property below describes the
     same instant. Do not refresh in here.
     """
-    # Open the attraction, once.
+    # Open the attraction, once. This is safe to write as a plain "if it is not
+    # open, open it" even though the loop runs 24 times a second: a button is not
+    # pressed again until the panel has actually changed in response, so the
+    # press below happens once and the rest are suppressed. Every action returns
+    # True if it pressed and False if it was suppressed, if you want to know.
     if not game.control.attraction_is_active:
         game.control.toggle_attraction()
         return
@@ -96,6 +100,10 @@ def main() -> None:
         # 0.0 lets the bot play as fast as it can. Set a floor (say 0.4) to find
         # out what the same strategy scores at human speed.
         min_click_interval=0.0,
+        # How long a button may go unanswered before the bot tries pressing it
+        # again. Set to 0 to press whenever your rules say to, and own the
+        # consequences — see Game._click.
+        reclick_after=1.0,
     )
 
     with game:

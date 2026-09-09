@@ -328,12 +328,41 @@ class PlaywrightBackend:
 
     # -- acting ---------------------------------------------------------------
     def click(self, x: int, y: int) -> None:
-        """Click a point in the current frame. Never scrolls to reach it."""
+        """Click a point in the current frame, then get out of the way.
+
+        The pointer is moved off the panel afterwards because a button under the
+        cursor may render its rollover state, and the bot would then be reading a
+        colour it caused itself. ``Attraction`` is the one that cannot survive
+        that: it is the only button whose two states differ by brightness alone
+        (#ffffff active against #cccccc closed) rather than by hue, so anything
+        that dims it reads as "closed" — and the answer to "closed" is to press
+        it again.
+        """
         fx, fy = float(x), float(y)
         if self._region is not None:
             fx += self._region.x
             fy += self._region.y
         self._page.mouse.click(fx / self._scale, fy / self._scale)
+        park = self._park_point()
+        if park is not None:
+            self._page.mouse.move(park[0] / self._scale, park[1] / self._scale)
+
+    def _park_point(self) -> tuple[float, float] | None:
+        """Somewhere in the frame that is not the panel, in frame coordinates."""
+        r = self._region
+        if r is None:
+            return None
+        w, h = self._frame_size or (r.right + 64, r.bottom + 64)
+        margin = 12.0
+        if r.y - margin > 0:
+            return (r.cx, r.y - margin)
+        if r.bottom + margin < h:
+            return (r.cx, r.bottom + margin)
+        if r.x - margin > 0:
+            return (r.x - margin, r.cy)
+        if r.right + margin < w:
+            return (r.right + margin, r.cy)
+        return None
 
     # -- the emulator ---------------------------------------------------------
     def trouble(self) -> str | None:
