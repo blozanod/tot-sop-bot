@@ -5,10 +5,11 @@ property then reads that frame until the next refresh, so a condition like
 ``lift.can_dispatch and not game.track.is_locked`` is guaranteed to describe a
 single instant rather than two moments a few milliseconds apart.
 
-A refresh measured end to end is about 21 ms, and almost none of it is here:
+A refresh measured end to end is about 52 ms, and almost none of it is here:
 
-    screenshot the panel crop   ~19 ms   the browser's, over CDP
-    decode the PNG               ~2 ms
+    wait for a painted frame    ~25 ms   the compositor's cadence
+    decode the PNG              ~27 ms   a full window, because clipping the
+                                         capture makes a headed page flash
     read all 32 buttons          0.05 ms  288 probe pixels, one vectorised vote
     a counter                    0.3 ms   lazy — only the ones you ask for
 
@@ -75,7 +76,7 @@ class Game:
         """
         backend_kw = {
             k: kw.pop(k)
-            for k in ("viewport", "timeout_ms", "uncapped_capture", "ruffle_config", "debug_dir")
+            for k in ("viewport", "timeout_ms", "frame_wait_ms", "ruffle_config", "debug_dir")
             if k in kw
         }
         return cls(PlaywrightBackend(url=url, headless=headless, **backend_kw), **kw)
@@ -115,11 +116,11 @@ class Game:
         return self._layout
 
     def refresh(self) -> bool:
-        """Take one screenshot and read the panel from it.
+        """Take one frame and read the panel from it.
 
         Returns True if the panel was there. Locating it happens at most once:
-        after that the frame is already cropped to the panel and the read is 288
-        pixel lookups.
+        after that the frame arrives already cropped to the panel and the read is
+        288 pixel lookups.
         """
         self._counts.clear()
         if self._layout is not None:
@@ -127,18 +128,22 @@ class Game:
             if self._read_buttons(strict=False):
                 return True
             # The probes stopped landing on palette colours. That is either drift
-            # — the canvas was resized under them — or the game has left the
+            # — the window was resized under them — or the game has left the
             # playing field. Both are answered by looking for the panel again.
             self._layout = None
             self.backend.set_region(None)
-        self._frame = self.backend.grab()
+        full = self.backend.grab()
         try:
-            layout = build_layout(self._frame)
+            layout = build_layout(full)
         except PanelError:
+            self._frame = full
             return False
         self.backend.set_region(layout.region)
         self._layout = layout
-        self._frame = self.backend.grab()
+        # Crop the frame already in hand rather than asking for another: a frame
+        # costs a PNG decode, and this one is as good as its successor.
+        r = layout.region
+        self._frame = full[r.y : r.bottom, r.x : r.right]
         # The panel is where this frame says it is, so a probe that still reads
         # nothing is a fill the calibration has never seen — not drift.
         return self._read_buttons(strict=True)

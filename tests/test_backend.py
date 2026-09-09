@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from tot import Game, PanelError, RuffleCrashed
-from tot.backends import ImageBackend, visible_clip
+from tot.backends import ImageBackend, _to_array
 from tot.geometry import Rect
 
 SHOTS = Path(__file__).resolve().parents[1] / "assets" / "screenshots"
@@ -94,34 +94,80 @@ class _NoPanel(_Panicking):
         pass
 
 
-# -- never move the page ------------------------------------------------------
+# -- the frame is cropped here, never in the browser -------------------------
 
-def test_a_clip_inside_the_window_is_left_alone() -> None:
-    box = {"px": 100.0, "py": 200.0, "w": 1200.0, "h": 700.0}
-    view = {"x": 0.0, "y": 0.0, "w": 1400.0, "h": 1000.0}
-    clip = visible_clip(box, Rect(50, 60, 900, 300), view)
-    assert clip == {"x": 150.0, "y": 260.0, "width": 900.0, "height": 300.0}
+class _Im:
+    """The bit of PIL's Image interface the crop path uses."""
 
+    def __init__(self, arr, mode="RGB"):
+        self.arr, self.mode = arr, mode
+        self.size = (arr.shape[1], arr.shape[0])
+        self.cropped: tuple | None = None
 
-def test_a_clip_past_the_bottom_is_trimmed_not_scrolled_to() -> None:
-    """The half that is showing, rather than moving the page to reach the rest."""
-    box = {"px": 0.0, "py": 400.0, "w": 1200.0, "h": 700.0}
-    view = {"x": 0.0, "y": 0.0, "w": 1400.0, "h": 900.0}
-    clip = visible_clip(box, Rect(0, 400, 900, 300), view)
-    assert clip["y"] == 800.0
-    assert clip["height"] == 100.0, "trimmed at the fold, not chased below it"
+    def crop(self, box):
+        x0, y0, x1, y1 = box
+        out = _Im(self.arr[y0:y1, x0:x1], self.mode)
+        out.cropped = box
+        return out
 
+    def convert(self, mode):
+        return _Im(self.arr[..., :3], mode)
 
-def test_a_clip_entirely_off_screen_collapses_rather_than_scrolling() -> None:
-    box = {"px": 0.0, "py": 2000.0, "w": 1200.0, "h": 700.0}
-    view = {"x": 0.0, "y": 0.0, "w": 1400.0, "h": 900.0}
-    clip = visible_clip(box, Rect(0, 0, 900, 300), view)
-    assert (clip["width"], clip["height"]) == (900.0, 1.0)
+    def __array__(self, dtype=None, copy=None):
+        return self.arr
 
 
-def test_a_scrolled_page_is_followed_without_being_moved() -> None:
-    """Page coordinates do not change when the user scrolls; the window's do."""
-    box = {"px": 0.0, "py": 400.0, "w": 1200.0, "h": 700.0}
-    scrolled = {"x": 0.0, "y": 300.0, "w": 1400.0, "h": 900.0}
-    clip = visible_clip(box, Rect(0, 400, 900, 300), scrolled)
-    assert clip == {"x": 0.0, "y": 800.0, "width": 900.0, "height": 300.0}
+def test_the_crop_happens_on_the_decoded_frame() -> None:
+    """The browser is never asked for a rectangle — it hands over the whole
+    window and the panel is sliced out of it here."""
+    full = np.arange(40 * 60 * 3, dtype=np.uint8).reshape(40, 60, 3)
+    out = _to_array(_Im(full), Rect(10, 5, 20, 12))
+    assert out.shape == (12, 20, 3)
+    assert np.array_equal(out, full[5:17, 10:30])
+
+
+def test_an_rgba_frame_loses_its_alpha_without_a_convert_pass() -> None:
+    rgba = np.zeros((8, 8, 4), np.uint8)
+    rgba[..., :3] = 200
+    rgba[..., 3] = 255
+    out = _to_array(_Im(rgba, "RGBA"), None)
+    assert out.shape == (8, 8, 3)
+    assert (out == 200).all()
+
+
+def test_no_region_means_the_whole_frame() -> None:
+    full = np.zeros((10, 12, 3), np.uint8)
+    assert _to_array(_Im(full), None).shape == (10, 12, 3)
+
+
+# -- clicking maps frame pixels back to CSS pixels ---------------------------
+
+class _Mouse:
+    def __init__(self) -> None:
+        self.clicks: list[tuple[float, float]] = []
+
+    def click(self, x: float, y: float) -> None:
+        self.clicks.append((x, y))
+
+
+def _fake_live_backend(scale: float, region: Rect | None):
+    from tot.backends import PlaywrightBackend
+
+    b = PlaywrightBackend.__new__(PlaywrightBackend)
+    b._region, b._scale = region, scale
+    b._page = type("P", (), {"mouse": _Mouse()})()
+    return b
+
+
+def test_a_click_is_offset_by_the_region() -> None:
+    b = _fake_live_backend(1.0, Rect(100, 50, 900, 300))
+    b.click(30, 20)
+    assert b._page.mouse.clicks == [(130.0, 70.0)]
+
+
+def test_a_click_is_scaled_back_on_a_hidpi_frame() -> None:
+    """A frame comes back at the display's real resolution; the mouse works in
+    CSS pixels, so a 2x screen needs the halving or every click misses."""
+    b = _fake_live_backend(2.0, Rect(200, 100, 900, 300))
+    b.click(60, 40)
+    assert b._page.mouse.clicks == [(130.0, 70.0)]

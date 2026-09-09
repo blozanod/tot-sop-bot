@@ -56,8 +56,10 @@ def main() -> int:
             trouble = backend.trouble()
             if trouble:
                 print(f"       !! the emulator is showing an error: {trouble}")
-            if backend.attach():
-                print(f"       canvas attached, {backend.canvas_size}")
+            size = backend.canvas_size
+            if size:
+                print(f"       canvas is {size[0]}x{size[1]}, "
+                      f"{backend._frame_seq} screencast frames so far")
 
             if args.click and tick in (2, 6):
                 print("       -> clicking the middle of the page")
@@ -66,7 +68,9 @@ def main() -> int:
                 except Exception as exc:
                     print(f"       (click failed: {exc})")
 
-            page.screenshot(path=str(OUT / f"probe-{tick * 2:03d}s.png"))
+            frame = backend.grab()
+            from PIL import Image
+            Image.fromarray(frame).save(OUT / f"probe-{tick * 2:03d}s.png")
             tick += 1
             page.wait_for_timeout(2000)
     finally:
