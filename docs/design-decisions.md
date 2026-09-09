@@ -298,3 +298,53 @@ Two things fell out of it: the capture is 6 ms cheaper than Playwright's helper,
 which waits for fonts and hides text carets on every call, and clicks now read the
 scroll position instead of assuming it, so scrolling mid-run no longer aims them
 at the wrong place.
+
+**30. Do not ask the browser for a screenshot at all.**
+Decision #29 stopped the bot scrolling, but kept the clipped capture. In a headed
+window that turns out to make the page visibly flash — resized to the clip
+rectangle, game gone, panel alone in the corner, once per tick. Every way of
+*asking* Chromium for pixels disturbs something:
+
+| | off-screen clip | disturbs the page | cost |
+| --- | --- | --- | --- |
+| `page.screenshot(clip=…)` | refuses | scroll, to satisfy the clip | 18.8 ms |
+| CDP, `captureBeyondViewport: true` | reaches it | a `resize` per capture | 14.3 ms |
+| CDP, clipped | blank | **flashes, headed** | 12.7 ms |
+| CDP, no clip | n/a | nothing | 39 ms |
+
+So frames are not requested. ``Page.startScreencast`` has the compositor push what
+it has already painted — the channel DevTools uses for its device preview — and
+the panel crop moves into numpy. There is no capture call, so there is no code
+path that could install an emulation override, which is a structural guarantee
+rather than a tuning one.
+
+Three things follow:
+
+* **Frames are PNG, never JPEG.** JPEG is smaller and decodes faster and would
+  quietly shift the flat fills by a unit or two, which is exactly the signal the
+  colour classification is an equality test on. `maxWidth`/`maxHeight` are set
+  past any real window for the same reason: a scaled frame is a resampled frame.
+* **The ack paces the stream, and goes out on arrival.** Chromium holds the next
+  frame until the last is acknowledged. Acking when a frame is *taken* instead
+  cost a whole paint cycle — 59 ms a tick against 41 — and bought only bandwidth
+  down a local socket.
+* **Clicks convert frame pixels to CSS pixels.** The frame arrives at the
+  display's real resolution, so on a HiDPI screen it is twice the size the mouse
+  works in. Detection never cared, since it finds the panel at whatever scale it
+  is drawn; clicking did, and silently, on any Retina display.
+
+The cost is a whole-window decode instead of a small clip: 27 ms rather than 2, so
+a tick is 41 ms rather than 19. That is the right trade. 24 Hz is still twenty
+times faster than a game that advances one game-minute per real second, and the
+thing being paid for is that the game stays on screen, still, while it plays.
+
+Also dropped here: `--disable-frame-rate-limit` and `--disable-gpu-vsync`. They
+were worth a few ms when every tick asked for a screenshot, and uncapping a
+compositor is a plausible way to make a real display flicker. The screencast takes
+frames at whatever rate the page paints, so neither is needed.
+
+> Note on how this was found: none of it reproduced under Xvfb. Scroll listeners,
+> resize listeners and per-frame viewport sampling all came back clean while the
+> flash was plainly visible on a real display. The fix is therefore structural —
+> remove the capability rather than tune around it — because the instrumentation
+> available here cannot prove a subtler fix works.

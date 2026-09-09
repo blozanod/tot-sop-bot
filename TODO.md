@@ -1,8 +1,8 @@
 # What is still open
 
-The perception layer is verified against the 12 calibration screenshots (56
-passing assertions) and is no longer the bottleneck — a tick is ~21 ms, of which
-~19 ms is Chromium taking the screenshot. What remains is knowledge, not code.
+The perception layer is verified against the 12 calibration screenshots (61
+passing assertions) and is no longer the bottleneck — a tick is ~41 ms, of which
+~41 ms is waiting for and decoding a frame. What remains is knowledge, not code.
 
 ---
 
@@ -88,7 +88,9 @@ button should be boxed with the right state and every counter labelled `ZERO`,
 python -m tools.benchmark --live
 ```
 
-for the tick rate on your machine.
+for the tick rate on your machine. Nothing on screen should move, flicker or
+resize while either of those runs — if anything does, say so, because that is a
+bug and not a trade-off.
 
 Remaining first-run risks:
 
