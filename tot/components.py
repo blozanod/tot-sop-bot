@@ -47,8 +47,10 @@ class _Unit:
     def _count(self, name: str) -> Count:
         return self.game._count(f"{self.prefix}.{name}")
 
-    def _press(self, name: str) -> None:
-        self.game._click(f"{self.prefix}.{name}")
+    def _press(self, name: str) -> bool:
+        """True if the button was pressed, False if the panel has not yet
+        answered the last press of it (see ``Game._click``)."""
+        return self.game._click(f"{self.prefix}.{name}")
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {self.prefix}>"
@@ -179,17 +181,17 @@ class TVRoom(_Queued):
         return self.preshow is PreshowState.RUNNING
 
     # -- actions --------------------------------------------------------------
-    def load(self) -> None:
-        self._press("load")
+    def load(self) -> bool:
+        return self._press("load")
 
-    def unload(self) -> None:
-        self._press("unload")
+    def unload(self) -> bool:
+        return self._press("unload")
 
-    def start_preshow(self) -> None:
-        self._press("preshow")
+    def start_preshow(self) -> bool:
+        return self._press("preshow")
 
-    def toggle_enabled(self) -> None:
-        self._press("enable")
+    def toggle_enabled(self) -> bool:
+        return self._press("enable")
 
 
 class Elevator(_Queued):
@@ -249,17 +251,17 @@ class Elevator(_Queued):
         """Dispatch is bright orange — this elevator is out on the track."""
         return self.dispatch_button is DispatchState.IN_MOTION
 
-    def load(self) -> None:
-        self._press("load")
+    def load(self) -> bool:
+        return self._press("load")
 
-    def dispatch(self) -> None:
-        self._press("dispatch")
+    def dispatch(self) -> bool:
+        return self._press("dispatch")
 
-    def toggle_enabled(self) -> None:
-        self._press("enable")
+    def toggle_enabled(self) -> bool:
+        return self._press("enable")
 
-    def toggle_doors(self) -> None:
-        self._press("doors")
+    def toggle_doors(self) -> bool:
+        return self._press("doors")
 
 
 class Track(_Unit):
@@ -347,23 +349,23 @@ class RideControl(_Unit):
     def bgm(self) -> ToggleState:
         return self._state("bgm")
 
-    def toggle_attraction(self) -> None:
-        self._press("attraction")
+    def toggle_attraction(self) -> bool:
+        return self._press("attraction")
 
-    def toggle_automatic_doors(self) -> None:
-        self._press("automatic_doors")
+    def toggle_automatic_doors(self) -> bool:
+        return self._press("automatic_doors")
 
-    def toggle_daytime(self) -> None:
-        self._press("daytime")
+    def toggle_daytime(self) -> bool:
+        return self._press("daytime")
 
-    def toggle_show_fullscreen(self) -> None:
-        self._press("show_fullscreen")
+    def toggle_show_fullscreen(self) -> bool:
+        return self._press("show_fullscreen")
 
-    def toggle_ride_sfx(self) -> None:
-        self._press("ride_sfx")
+    def toggle_ride_sfx(self) -> bool:
+        return self._press("ride_sfx")
 
-    def toggle_tv_room_sound(self) -> None:
-        self._press("tv_room_sound")
+    def toggle_tv_room_sound(self) -> bool:
+        return self._press("tv_room_sound")
 
-    def toggle_bgm(self) -> None:
-        self._press("bgm")
+    def toggle_bgm(self) -> bool:
+        return self._press("bgm")

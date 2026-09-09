@@ -348,3 +348,44 @@ frames at whatever rate the page paints, so neither is needed.
 > flash was plainly visible on a real display. The fix is therefore structural —
 > remove the capability rather than tune around it — because the instrumentation
 > available here cannot prove a subtler fix works.
+
+**31. Press once per cue, not once per frame.**
+The bot was opening and closing the ride on alternate frames. Two separate causes,
+and the interesting one is not the one you would guess.
+
+*The bot was reading a colour it caused itself.* `mouse.click()` leaves the pointer
+on the button. A button under the cursor may render a rollover state, and
+`Attraction` is uniquely unable to survive that: it is the only button on the panel
+whose two states differ by **brightness alone** — `#ffffff` active against
+`#cccccc` closed — rather than by hue (`findings.md` §1 called this out as exact to
+a pixel test and invisible to a person; it is also exactly what a rollover shifts).
+Anything that dims it reads as "closed", and the answer to "closed" is to press it
+again. So the pointer is parked off the panel after every click.
+
+*A frame is a picture of the past.* It was painted before the last click reached
+the game, so a loop re-deciding every 40 ms acts on a reading that predates its own
+last action. This one does not need a rollover or a slow game to bite — in the
+harness, a game with **zero** response latency still toggled 42 times in four
+seconds, purely from the capture pipeline's own delay. So a button is not pressed
+again while it still looks exactly as it did when it was last pressed.
+
+Measured against a fake panel with a 250 ms response and a rollover, over four
+seconds:
+
+| | ride toggled |
+| --- | --- |
+| neither fix | 63 times, one per tick |
+| pointer parked only | 36 times |
+| press guard only | 4 times |
+| both | **once**, and it stays open |
+
+Neither alone is enough, which is why both are in. Parking does not help while the
+game is merely slow; the guard does not help while the button never appears to
+change, because its retry keeps firing.
+
+The guard is deliberately a *correctness* rule and not a strategy one, so it stays
+in the library without violating #2 and #10. It expresses "do not press a button
+the panel has not answered", which no strategy would ever want to override — and
+where one might, `reclick_after=0` turns it off, and every action returns whether
+it actually pressed. `reclick_after` also bounds the wait, so a click the game
+simply dropped is retried instead of deadlocking that button forever.
