@@ -1,12 +1,13 @@
-"""The button palette.
+"""The button palette, and how to read a lot of pixels at once.
 
-Measured from the calibration screenshots in ``assets/screenshots``. Button fills
-are exact flat colours with no anti-aliasing in the interior, so classification is
-an equality test on the median of a probe patch, not a nearest-match problem. The
-distance machinery exists only to produce a useful error message when nothing
-matches.
+Button fills are exact flat colours with no anti-aliasing in the interior, and the
+only other thing inside a button is pure black text. So a colour reading is a
+majority vote over a handful of interior pixels — no averaging, no nearest-match,
+no per-button numpy call.
 
-See ``docs/findings.md`` for how each value was derived.
+Everything here works on *packed* pixels: one uint32 per pixel instead of three
+uint8s. That turns colour comparison into integer equality, which is what makes
+whole-frame masking cheap enough to run on every frame.
 """
 
 from __future__ import annotations
@@ -39,44 +40,56 @@ PALETTE: tuple[Color, ...] = tuple(Color)
 #: Fill of the panel behind the buttons, and of the counter box interiors.
 PANEL_BACKGROUND = (39, 39, 39)
 
-#: How far a sampled colour may sit from a palette entry before we refuse to
-#: classify it. Fills are exact, so anything beyond a couple of units means the
-#: probe landed off the button — a layout problem, not a colour problem.
-MAX_DISTANCE = 12.0
+
+def pack(frame: np.ndarray) -> np.ndarray:
+    """(H, W, 3) uint8 RGB -> (H, W) uint32, one integer per pixel."""
+    h, w, _ = frame.shape
+    buf = np.zeros((h, w, 4), np.uint8)
+    buf[:, :, :3] = frame
+    return buf.view(np.uint32).reshape(h, w)
 
 
-def classify(rgb: tuple[int, int, int]) -> Color | None:
-    """Return the palette colour for ``rgb``, or None if nothing is close enough."""
-    best, best_d = None, float("inf")
-    for c in PALETTE:
-        d = float(np.linalg.norm(np.subtract(rgb, c.value)))
-        if d < best_d:
-            best, best_d = c, d
-    return best if best_d <= MAX_DISTANCE else None
+#: The palette as packed pixels, in PALETTE order. Built through ``pack`` so the
+#: byte order matches whatever this machine is.
+CODES: np.ndarray = pack(np.array([[c.value for c in PALETTE]], np.uint8))[0]
 
 
-def nearest(rgb: tuple[int, int, int]) -> tuple[Color, float]:
-    """Nearest palette colour and its distance, ignoring MAX_DISTANCE.
+def palette_mask(code: np.ndarray) -> np.ndarray:
+    """Which pixels of a packed frame are a palette colour.
 
-    Used to build error messages, and by ``on_unknown="nearest"``.
+    Eight integer comparisons over the frame. ``np.isin`` would sort 2M pixels to
+    answer the same question and is several times slower.
     """
-    best, best_d = PALETTE[0], float("inf")
-    for c in PALETTE:
-        d = float(np.linalg.norm(np.subtract(rgb, c.value)))
-        if d < best_d:
-            best, best_d = c, d
-    return best, best_d
+    mask = code == CODES[0]
+    for c in CODES[1:]:
+        mask |= code == c
+    return mask
 
 
-def sample(frame: np.ndarray, x: int, y: int, w: int, h: int) -> tuple[int, int, int]:
-    """Modal colour of the middle of a rect.
+def vote(frame: np.ndarray, ys: np.ndarray, xs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Read one palette colour per row of a sample grid.
 
-    Takes the centre half of the rect so a border or a rounded corner can never
-    contribute, and the mode rather than the mean so a stray text pixel cannot
-    drag the reading between two palette entries.
+    ``ys`` and ``xs`` are (N, K) integer arrays: K probe points inside each of N
+    buttons. Returns (N,) palette indices and an (N,) count of how many probes
+    agreed. Probes that land on the button's black text match nothing and simply
+    do not vote, so the fill wins on any grid that touches it at all.
     """
-    x0, y0 = x + w // 4, y + h // 4
-    patch = frame[y0 : y0 + max(1, h // 2), x0 : x0 + max(1, w // 2)].reshape(-1, 3)
-    vals, counts = np.unique(patch, axis=0, return_counts=True)
-    r, g, b = vals[int(counts.argmax())]
+    code = pack(frame[ys, xs])
+    hits = code[:, :, None] == CODES[None, None, :]
+    tally = hits.sum(axis=1)
+    idx = tally.argmax(axis=1)
+    return idx, tally[np.arange(len(idx)), idx]
+
+
+def modal_rgb(frame: np.ndarray, ys: np.ndarray, xs: np.ndarray) -> tuple[int, int, int]:
+    """The most common colour among one button's probe points.
+
+    Used for error messages and debugging only. Sampling the button's centre
+    pixel instead would as often as not report the black of its caption.
+    """
+    pix = frame[ys, xs].reshape(-1, 3)
+    code = pack(pix.reshape(1, -1, 3))[0]
+    vals, counts = np.unique(code, return_counts=True)
+    first = int(np.flatnonzero(code == vals[int(counts.argmax())])[0])
+    r, g, b = pix[first]
     return int(r), int(g), int(b)

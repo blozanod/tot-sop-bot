@@ -5,9 +5,9 @@ so that its behaviour can be turned into a standard operating procedure a person
 can follow.
 
 The bot is the instrument, not the product. It reads the RideControl panel the way
-a player does — button colours and counter digits — and holds **no strategy at
-all**. Every decision lives in `main.py`, hand-written, so each branch maps to one
-instruction a human can carry out.
+a player does — button colours, and whether a counter says 0 or 21 — and holds
+**no strategy at all**. Every decision lives in `main.py`, hand-written, so each
+branch maps to one instruction a human can carry out.
 
 ## Install
 
@@ -18,20 +18,26 @@ playwright install chromium
 
 ## Use
 
+```bash
+python main.py
+```
+
+It opens the page and then **waits**. You load the game and pick the mode; it
+touches nothing. The moment the RideControl panel appears on screen the game has
+begun, and it starts playing.
+
 ```python
 from tot import Game
 
-game = Game.launch()          # opens Chromium, attaches to the game canvas
-game.refresh()                # one screenshot; every property reads that frame
+game = Game.launch()      # opens Chromium. Clicks nothing.
+game.wait_for_panel()     # blocks while you pick a game mode
 
-if game.tv_room1.preshow_ready:            # Start Preshow has turned orange
-    game.tv_room1.start_preshow()
-
-for lift in game.elevators.values():
-    if lift.can_dispatch and not game.track.is_locked:
-        lift.dispatch()
-
-game.wait_until(lambda: game.tv_room1.unload_ready, timeout=60)
+while game.refresh():                       # one screenshot per tick
+    if game.tv_room1.preshow_ready:         # Start Preshow has turned orange
+        game.tv_room1.start_preshow()
+    for lift in game.elevators.values():
+        if lift.can_dispatch and not game.track.is_locked:
+            lift.dispatch()
 ```
 
 Write your strategy in [`main.py`](main.py); it lists the full readable surface.
@@ -40,11 +46,26 @@ Write your strategy in [`main.py`](main.py); it lists the full readable surface.
 
 | | |
 | --- | --- |
-| **Sees** | Playwright screenshots the game canvas. No hardcoded coordinates — the button grid is detected from the pixels, so canvas size, browser zoom and letterboxing are irrelevant. |
-| **Classifies** | Eight exact flat fills measured from the calibration screenshots. An unrecognised colour raises rather than guessing. |
-| **Counts** | One pixel font covers every number on screen. Digits are matched by normalised grayscale correlation with a confidence floor; a low-confidence read raises. |
+| **Sees** | Playwright screenshots **only the RideControl panel** — about 930×290 px, an eighth of the canvas. No hardcoded coordinates: the panel is found from the pixels once, at startup, and that rectangle is what gets captured from then on. |
+| **Classifies** | Eight exact flat fills. All 32 buttons are read in one vectorised majority vote over 288 probe pixels — 0.05 ms. |
+| **Counts** | Only **0** and **21**. Every other value is `OTHER`, because every other value means the same thing: wait. Counters are read lazily, so a tick that only looks at colours never touches a digit. |
 | **Acts** | Clicks and nothing else — no precondition checks, no waiting for animations. That is your job. |
-| **Records** | JSONL trace of every action with the state it was taken in, plus an event whenever anything on the panel changes. |
+
+### What it costs
+
+Measured with `python -m tools.benchmark`:
+
+| | |
+| --- | --- |
+| locate the panel, full canvas | 77 ms — **once**, at startup |
+| screenshot the panel crop | ~19 ms — the browser's cost, not ours |
+| read all 32 buttons | 0.05 ms |
+| read one counter | 0.3 ms |
+| **a whole tick** | **~21 ms → ~47 Hz** |
+
+The screenshot is 90% of that and is entirely the browser's. See
+[`docs/design-decisions.md`](docs/design-decisions.md) §21 for why the bot is
+still in Python.
 
 ### One property, one observable
 
@@ -53,45 +74,49 @@ button is bright green" — not "green *and* the doors are shut *and* the track 
 clear". A compound property would hide the decision the written procedure is
 supposed to make explicit.
 
-Every button exposes both a meaning-enum and a boolean alias:
-
 ```python
 game.elevator1.dispatch_button   # DispatchState.ARMED
 game.elevator1.can_dispatch      # True
 game.track.is_locked             # False
+game.tv_room1.waiting_is_full    # True  — the box reads 21
+game.tv_room1.loaded             # Count.ZERO / Count.FULL / Count.OTHER
 ```
 
-### The trace is the draft procedure
+### The two numbers
 
-```
-0.42  elevator1.doors     CLOSED -> MOVING
-0.42  elevator1.load      READY -> LOADING
-0.43  elevator1.loaded    0 -> 3
-0.47  elevator1.dispatch  UNAVAILABLE -> ARMED
-0.48  ACTION Dispatch Elevator while ARMED (cue age 0.025s)
-      :: Dispatch is bright green — the elevator can be sent now
-0.55  control.track       READY -> LOCKED
-```
+A counter says one of three things, and never a number:
 
-`cue_age_s` is how long a button sat in its state before being pressed — the
-number that says whether a step is humanly achievable. The game runs at roughly
-one game-minute per real second, so this matters.
+| | |
+| --- | --- |
+| `Count.ZERO` | the box reads `0` — nothing to move |
+| `Count.FULL` | the box reads `21` — a full load |
+| `Count.OTHER` | anything else, including a box it could not read |
+
+`OTHER` is the safe direction: a glyph the reader is not confident about lands
+there, and the bot waits instead of acting on a misread.
 
 ## Verify the calibration
 
 ```bash
 python -m tools.verify_layout          # annotate the calibration frames
 python -m tools.verify_layout --live   # annotate a frame from the running game
-python -m pytest                       # 44 assertions against the screenshots
+python -m tools.benchmark              # what perception costs on your machine
+python -m pytest                       # 56 assertions against the screenshots
 ```
 
 The test suite runs the whole stack against PNGs with no browser. That is what
 makes the palette and geometry *verified* rather than guessed — the game was never
 reachable from the machine this was written on.
 
+If the panel is never found, run the probe and send me its output:
+
+```bash
+python -m tools.probe_page
+```
+
 ## Docs
 
 - [`docs/findings.md`](docs/findings.md) — the measured palette, geometry and state semantics
-- [`docs/design-decisions.md`](docs/design-decisions.md) — 20 decisions and why
+- [`docs/design-decisions.md`](docs/design-decisions.md) — the decisions and why, including the ones since reversed
 - [`docs/game-mechanics.md`](docs/game-mechanics.md) — open questions only you can answer
 - [`TODO.md`](TODO.md) — what is still unverified

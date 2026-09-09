@@ -1,44 +1,39 @@
 """The game object: one frozen frame, and everything readable off it.
 
-``refresh()`` takes exactly one screenshot and decodes the whole panel from it.
-Every property then reads that frame until the next refresh, so a condition like
-``e.can_dispatch and e.loaded == 21`` is guaranteed to describe a single instant
-rather than two moments a few milliseconds apart.
+``refresh()`` takes exactly one screenshot and reads all 32 buttons from it. Every
+property then reads that frame until the next refresh, so a condition like
+``lift.can_dispatch and not game.track.is_locked`` is guaranteed to describe a
+single instant rather than two moments a few milliseconds apart.
+
+A refresh measured end to end is about 21 ms, and almost none of it is here:
+
+    screenshot the panel crop   ~19 ms   the browser's, over CDP
+    decode the PNG               ~2 ms
+    read all 32 buttons          0.05 ms  288 probe pixels, one vectorised vote
+    a counter                    0.3 ms   lazy — only the ones you ask for
+
+The counters are lazy on purpose. A tick that only looks at button colours never
+segments a single digit.
 """
 
 from __future__ import annotations
 
 import time
-from enum import Enum
-from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
 
 from .backends import DEFAULT_URL, Backend, ImageBackend, PlaywrightBackend
-from .colors import Color, classify, nearest, sample
+from .colors import PALETTE, Color, modal_rgb, vote
 from .components import Elevator, RideControl, Track, TVRoom
-from .digits import DigitReader
-from .errors import (
-    DigitError,
-    LayoutError,
-    NotPlayingError,
-    UnknownColorError,
-    UnmappedStateError,
-)
+from .counters import Count, CounterReader
+from .errors import PanelError, UnknownColorError, UnmappedStateError
 from .geometry import Layout, build_layout
-from .states import spec_for
-from .trace import Trace
+from .states import meanings
 
-
-class Screen(Enum):
-    """Which screen the canvas is showing."""
-
-    PLAYING = "playing"
-    #: Anything else — the mode chooser, a loading screen, a game-over card. The
-    #: chooser occupies the same canvas area as the RideControl panel, so reads
-    #: are refused here rather than returning a confident misreading of a dialog.
-    UNKNOWN = "unknown"
+#: A probe grid is 9 points. Fewer than this many agreeing means the panel has
+#: moved out from under them, not that the button is an odd colour.
+_MIN_VOTES = 3
 
 
 class Game:
@@ -47,28 +42,21 @@ class Game:
     def __init__(
         self,
         backend: Backend,
-        trace: Trace | str | Path | None = "logs/run.jsonl",
         on_unknown: str = "raise",
         min_click_interval: float = 0.0,
-        reader: DigitReader | None = None,
+        reader: CounterReader | None = None,
     ):
-        if on_unknown not in ("raise", "unknown", "nearest"):
-            raise ValueError("on_unknown must be 'raise', 'unknown' or 'nearest'")
+        if on_unknown not in ("raise", "ignore"):
+            raise ValueError("on_unknown must be 'raise' or 'ignore'")
         self.backend = backend
-        self.trace = trace if isinstance(trace, Trace) else Trace(trace)
         self.on_unknown = on_unknown
         self.min_click_interval = min_click_interval
-        self.reader = reader or DigitReader()
-
-        self._frame: np.ndarray | None = None
+        self._reader = reader
         self._layout: Layout | None = None
-        self._screen = Screen.UNKNOWN
-        self._colors: dict[str, Color | None] = {}
+        self._frame: np.ndarray | None = None
         self._states: dict[str, Any] = {}
-        self._counts: dict[str, int | DigitError] = {}
-        self._since: dict[str, float] = {}
+        self._counts: dict[str, Count] = {}
         self._last_click = 0.0
-        self._flagged: set[str] = set()
 
         self.tv_rooms = {i: TVRoom(self, i) for i in (1, 2)}
         self.elevators = {i: Elevator(self, i) for i in (1, 2, 3)}
@@ -77,30 +65,41 @@ class Game:
         self.control = RideControl(self)
         self.track = Track(self)
 
-        self.trace.write("run_start", on_unknown=on_unknown, min_click_interval=min_click_interval)
-
     # -- construction ---------------------------------------------------------
     @classmethod
     def launch(cls, url: str = DEFAULT_URL, headless: bool = False, **kw: Any) -> Game:
-        """Open Chromium, load the game, and attach to its canvas.
+        """Open Chromium and load the page. Nothing is clicked.
 
-        Stops at whatever screen the game shows — choosing a mode, opening the
-        attraction and enabling units are strategy, so they stay in your file.
+        The game is yours to start: this returns as soon as the page is open, and
+        ``wait_for_panel()`` is what blocks until you have picked a mode.
         """
-        return cls(PlaywrightBackend(url=url, headless=headless), **kw)
+        backend_kw = {
+            k: kw.pop(k)
+            for k in ("viewport", "timeout_ms", "uncapped_capture", "ruffle_config", "debug_dir")
+            if k in kw
+        }
+        return cls(PlaywrightBackend(url=url, headless=headless, **backend_kw), **kw)
 
     @classmethod
-    def from_image(cls, path: str | Path, **kw: Any) -> Game:
+    def from_image(cls, path: str, **kw: Any) -> Game:
         """A game backed by a still PNG. Used by the fixture tests."""
-        kw.setdefault("trace", None)
         g = cls(ImageBackend(path), **kw)
         g.refresh()
         return g
 
+    @property
+    def reader(self) -> CounterReader:
+        """Built on first use, so a run that never reads a counter never loads
+        the template set."""
+        if self._reader is None:
+            self._reader = CounterReader()
+        return self._reader
+
     # -- the frame ------------------------------------------------------------
     @property
-    def screen(self) -> Screen:
-        return self._screen
+    def panel_visible(self) -> bool:
+        """Was the RideControl panel there as of the last refresh?"""
+        return self._layout is not None
 
     @property
     def frame(self) -> np.ndarray:
@@ -112,193 +111,155 @@ class Game:
     @property
     def layout(self) -> Layout:
         if self._layout is None:
-            raise NotPlayingError("the panel has not been located; call refresh() first")
+            raise PanelError("the panel has not been located; call refresh() first")
         return self._layout
 
-    def refresh(self) -> Screen:
-        """Take one screenshot and decode the whole panel from it."""
-        self._frame = self.backend.grab()
-        if self._layout is None or not self._verify():
-            try:
-                self._layout = build_layout(self._frame)
-            except LayoutError:
-                self._layout, self._screen = None, Screen.UNKNOWN
-                return self._screen
-        self._screen = Screen.PLAYING
-        self._decode()
-        return self._screen
+    def refresh(self) -> bool:
+        """Take one screenshot and read the panel from it.
 
-    def _verify(self) -> bool:
-        """Do the cached button rects still land on palette colours?"""
+        Returns True if the panel was there. Locating it happens at most once:
+        after that the frame is already cropped to the panel and the read is 288
+        pixel lookups.
+        """
+        self._counts.clear()
+        if self._layout is not None:
+            self._frame = self.backend.grab()
+            if self._read_buttons(strict=False):
+                return True
+            # The probes stopped landing on palette colours. That is either drift
+            # — the canvas was resized under them — or the game has left the
+            # playing field. Both are answered by looking for the panel again.
+            self._layout = None
+            self.backend.set_region(None)
+        self._frame = self.backend.grab()
+        try:
+            layout = build_layout(self._frame)
+        except PanelError:
+            return False
+        self.backend.set_region(layout.region)
+        self._layout = layout
+        self._frame = self.backend.grab()
+        # The panel is where this frame says it is, so a probe that still reads
+        # nothing is a fill the calibration has never seen — not drift.
+        return self._read_buttons(strict=True)
+
+    def _read_buttons(self, strict: bool) -> bool:
+        """Read all 32 colours in one shot.
+
+        Returns False if a probe grid did not settle on a palette colour. When
+        ``strict``, the layout was just rebuilt from this very frame, so that can
+        only mean an unknown fill — which raises rather than being read as "the
+        panel is gone".
+        """
         assert self._layout is not None and self._frame is not None
-        h, w = self._frame.shape[:2]
-        for rect in self._layout.buttons.values():
-            if rect.bottom > h or rect.right > w:
-                return False
-            if classify(sample(self._frame, rect.x, rect.y, rect.w, rect.h)) is None:
-                return False
+        lay = self._layout
+        try:
+            idx, votes = vote(self._frame, lay.probe_y, lay.probe_x)
+        except IndexError:  # the crop came back the wrong size
+            return False
+        if int(votes.min()) < _MIN_VOTES:
+            if strict and self.on_unknown == "raise":
+                bad = int(np.argmin(votes))
+                rgb = modal_rgb(self._frame, lay.probe_y[bad], lay.probe_x[bad])
+                raise UnknownColorError(lay.keys[bad], rgb, int(votes[bad]))
+            return False
+
+        for key, i in zip(lay.keys, idx.tolist()):
+            color = PALETTE[i]
+            state = meanings(key).get(color)
+            if state is None:
+                raise UnmappedStateError(
+                    key, color.name, [c.name for c in meanings(key)]
+                )
+            self._states[key] = state
         return True
 
-    def _decode(self) -> None:
-        assert self._layout is not None and self._frame is not None
-        now = time.monotonic()
-        clock = None
+    def wait_for_panel(self, timeout: float = 600.0, poll: float = 1.0) -> bool:
+        """Block until the RideControl panel is on screen.
 
-        for key, rect in self._layout.buttons.items():
-            rgb = sample(self._frame, rect.x, rect.y, rect.w, rect.h)
-            color = classify(rgb)
-            if color is None:
-                near, dist = nearest(rgb)
-                if self.on_unknown == "raise":
-                    raise UnknownColorError(key, rgb, near.name, dist)
-                color = near if self.on_unknown == "nearest" else None
-            self._colors[key] = color
-
-            spec = spec_for(key)
-            state = spec.state(color) if color is not None else None
-            if color is not None and state is None:
-                raise UnmappedStateError(
-                    key, color.name, [s.name for s in spec.by_color.values()]
-                )
-            old = self._states.get(key, _MISSING)
-            self._states[key] = state
-            if old is not _MISSING and old is not state and state is not None:
-                self._since[key] = now
-                self.trace.state_change(key, old, state, spec.gloss[state], clock)
-            elif key not in self._since:
-                self._since[key] = now
-            if state is not None and spec.is_inferred(state) and key not in self._flagged:
-                self._flagged.add(key)
-                self.trace.write(
-                    "inferred_state",
-                    key=key,
-                    state=state.name,
-                    note="this colour was never observed on this button in the "
-                    "calibration screenshots; the meaning is inferred",
-                )
-
-        for key, rect in self._layout.counters.items():
-            try:
-                value: int | DigitError = self.reader.read_int(self._frame, rect, key)
-            except DigitError as exc:
-                value = exc
-            old = self._counts.get(key, _MISSING)
-            self._counts[key] = value
-            if old is not _MISSING and isinstance(value, int) and old != value:
-                self.trace.write("state_change", key=key, **{"from": old, "to": value})
+        This is the bot's whole startup sequence. Load the page, pick your game
+        mode, and the moment the panel appears the game has begun and this
+        returns. Nothing is clicked while waiting.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            if self.refresh():
+                return True
+            check = getattr(self.backend, "check", None)
+            if check is not None:
+                check()
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(poll)
 
     # -- reading --------------------------------------------------------------
-    def _require_playing(self) -> None:
-        if self._frame is None:
-            self.refresh()
-        if self._screen is not Screen.PLAYING:
-            raise NotPlayingError(
-                "the canvas is not showing the playing field, so panel readings "
-                "would be meaningless. Check game.screen before reading."
+    def _require_panel(self) -> None:
+        if self._layout is None:
+            raise PanelError(
+                "the RideControl panel is not on screen, so panel readings would be "
+                "meaningless. Check game.panel_visible before reading."
             )
-
-    def _color(self, key: str) -> Color | None:
-        self._require_playing()
-        return self._colors[key]
 
     def _state(self, key: str) -> Any:
-        self._require_playing()
+        self._require_panel()
         return self._states[key]
 
-    def _count(self, key: str) -> int:
-        self._require_playing()
-        value = self._counts[key]
-        if isinstance(value, DigitError):
-            raise value
-        return value
+    def _count(self, key: str) -> Count:
+        """A counter box, read on demand and cached until the next refresh."""
+        self._require_panel()
+        hit = self._counts.get(key)
+        if hit is None:
+            rect = self.layout.counters.get(key)
+            if rect is None:
+                raise PanelError(f"no counter box was found for {key}")
+            hit = self._counts[key] = self.reader.read(self.frame, rect)
+        return hit
 
-    # -- the HUD --------------------------------------------------------------
-    @property
-    def clock(self) -> str:
-        """The Current Time box, as ``HH:MM``."""
-        self._require_playing()
-        rect = self.layout.hud.get("clock")
-        if rect is None:
-            raise NotPlayingError(
-                "the Current Time box was not found — it sits outside the panel, so "
-                "this frame may be cropped to the panel alone."
-            )
-        return self.reader.read_clock(self.frame, rect)
-
-    @property
-    def score(self) -> int:
-        """The Your score box."""
-        self._require_playing()
-        rect = self.layout.hud.get("score")
-        if rect is None:
-            raise NotPlayingError("the Your score box was not found in this frame.")
-        return self.reader.read_int(self.frame, rect, "score", band="last")
+    def color(self, key: str) -> Color:
+        """The fill of one button, for debugging a surprising state."""
+        self._require_panel()
+        lay = self.layout
+        i = lay.keys.index(key)
+        return Color(modal_rgb(self.frame, lay.probe_y[i], lay.probe_x[i]))
 
     # -- acting ---------------------------------------------------------------
     def _click(self, key: str) -> None:
-        self._require_playing()
+        self._require_panel()
         rect = self.layout.buttons[key]
-        spec = spec_for(key)
-        state = self._states[key]
-
         wait = self.min_click_interval - (time.monotonic() - self._last_click)
         if wait > 0:
             time.sleep(wait)
-
         self.backend.click(int(rect.cx), int(rect.cy))
         self._last_click = time.monotonic()
-        since = self._since.get(key)
-        self.trace.action(
-            key,
-            spec.screen_name,
-            state,
-            spec.gloss.get(state, "") if state else "",
-            None if since is None else time.monotonic() - since,
-            None,
-        )
 
     # -- waiting --------------------------------------------------------------
     def wait_until(
-        self, predicate: Callable[[], bool], timeout: float = 30.0, poll: float = 0.1
+        self, predicate: Callable[[], bool], timeout: float = 30.0, poll: float = 0.0
     ) -> bool:
         """Refresh and poll until ``predicate()`` is true, or ``timeout`` elapses.
 
         Returns True if it came true, False on timeout — it never raises, so a
         miscalibrated colour surfaces as a False you can branch on rather than
-        hanging the run forever.
+        hanging the run forever. The default poll is 0: a screenshot already takes
+        ~20 ms, which is a fast enough loop that sleeping on top of it only adds
+        latency to the cue you are waiting for.
         """
         deadline = time.monotonic() + timeout
         while True:
-            self.refresh()
-            if self._screen is Screen.PLAYING and predicate():
+            if self.refresh() and predicate():
                 return True
             if time.monotonic() >= deadline:
-                self.trace.write("wait_timeout", timeout_s=timeout)
                 return False
-            time.sleep(poll)
+            if poll:
+                time.sleep(poll)
 
     # -- inspection -----------------------------------------------------------
-    def snapshot(self) -> dict[str, Any]:
-        """Every observable from the current frame, as plain values."""
-        self._require_playing()
-        out: dict[str, Any] = {
-            k: (v.name if v is not None else None) for k, v in self._states.items()
-        }
-        for k, v in self._counts.items():
-            out[k] = None if isinstance(v, DigitError) else v
-        return out
-
     def describe(self) -> list[str]:
-        """The current frame in plain English, one line per control."""
-        self._require_playing()
-        lines = []
-        for key, state in self._states.items():
-            if state is not None:
-                lines.append(f"{key}: {spec_for(key).gloss[state]}")
-        return lines
+        """Every button state from the current frame, one line each."""
+        self._require_panel()
+        return [f"{key} = {state.name}" for key, state in self._states.items()]
 
     def close(self) -> None:
-        self.trace.close()
         self.backend.close()
 
     def __enter__(self) -> Game:
@@ -306,10 +267,3 @@ class Game:
 
     def __exit__(self, *exc: Any) -> None:
         self.close()
-
-
-class _Missing:
-    pass
-
-
-_MISSING = _Missing()

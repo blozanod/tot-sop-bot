@@ -1,10 +1,14 @@
 """The three families of control: TV rooms, elevators, and RideControl.
 
-Every property maps to exactly one thing on screen — one button's colour or one
-counter's digits. Nothing here combines two observables, because a compound
-property would hide the decision that the written procedure is supposed to make
-explicit. Each button exposes both a meaning-enum and a plain boolean alias, so
-strategy code can read either way.
+Every property maps to exactly one thing on screen — one button's colour, or one
+counter box being empty or full. Nothing here combines two observables, because a
+compound property would hide the decision that the written procedure is supposed
+to make explicit.
+
+The counters expose only ``_is_zero`` and ``_is_full``. Those are the two readings
+that change what a player does: zero means there is nothing to move, 21 means a
+full load is ready. Every other number means the same thing — wait — so the bot
+does not spend a frame working out which one it is.
 
 Actions click and nothing else: no precondition check, no waiting for animations,
 no refresh afterwards. All of that belongs in the strategy file.
@@ -24,58 +28,23 @@ from .states import (
     ToggleState,
     TrackState,
     UnloadState,
-    spec_for,
 )
 
 if TYPE_CHECKING:
+    from .counters import Count
     from .game import Game
-
-
-class Button:
-    """One control on the panel: its colour, its meaning, and a way to press it."""
-
-    def __init__(self, game: Game, key: str):
-        self.game, self.key = game, key
-        self.spec = spec_for(key)
-
-    @property
-    def screen_name(self) -> str:
-        return self.spec.screen_name
-
-    @property
-    def color(self):
-        return self.game._color(self.key)
-
-    @property
-    def state(self) -> Any:
-        return self.game._state(self.key)
-
-    @property
-    def gloss(self) -> str:
-        return self.spec.gloss[self.state]
-
-    def click(self) -> None:
-        self.game._click(self.key)
-
-    def __repr__(self) -> str:
-        return f"<Button {self.key} {self.state.name}>"
 
 
 class _Unit:
     """Shared plumbing for a component that owns buttons and counters."""
 
-    prefix: str
-
     def __init__(self, game: Game, prefix: str):
         self.game, self.prefix = game, prefix
-
-    def button(self, name: str) -> Button:
-        return Button(self.game, f"{self.prefix}.{name}")
 
     def _state(self, name: str) -> Any:
         return self.game._state(f"{self.prefix}.{name}")
 
-    def _count(self, name: str) -> int:
+    def _count(self, name: str) -> Count:
         return self.game._count(f"{self.prefix}.{name}")
 
     def _press(self, name: str) -> None:
@@ -85,23 +54,46 @@ class _Unit:
         return f"<{type(self).__name__} {self.prefix}>"
 
 
-class TVRoom(_Unit):
+class _Queued(_Unit):
+    """A unit with a Waiting and a Loaded box."""
+
+    @property
+    def waiting(self) -> Count:
+        """This unit's Waiting box: ZERO, FULL, or OTHER."""
+        return self._count("waiting")
+
+    @property
+    def loaded(self) -> Count:
+        """This unit's Loaded box: ZERO, FULL, or OTHER."""
+        return self._count("loaded")
+
+    @property
+    def waiting_is_zero(self) -> bool:
+        """Nobody is queued for this unit."""
+        return self._count("waiting").is_zero
+
+    @property
+    def waiting_is_full(self) -> bool:
+        """21 queued — a full load is available."""
+        return self._count("waiting").is_full
+
+    @property
+    def loaded_is_zero(self) -> bool:
+        """This unit is empty."""
+        return self._count("loaded").is_zero
+
+    @property
+    def loaded_is_full(self) -> bool:
+        """21 aboard — this unit will take no more."""
+        return self._count("loaded").is_full
+
+
+class TVRoom(_Queued):
     """One of the two TV rooms: its queue, its doors, and its preshow."""
 
     def __init__(self, game: Game, index: int):
         super().__init__(game, f"tv_room{index}")
         self.index = index
-
-    # -- counters -------------------------------------------------------------
-    @property
-    def waiting(self) -> int:
-        """The number in this room's Waiting box."""
-        return self._count("waiting")
-
-    @property
-    def loaded(self) -> int:
-        """The number in this room's Loaded box."""
-        return self._count("loaded")
 
     # -- buttons --------------------------------------------------------------
     @property
@@ -200,20 +192,12 @@ class TVRoom(_Unit):
         self._press("enable")
 
 
-class Elevator(_Unit):
+class Elevator(_Queued):
     """One of the three elevators: its queue, its doors, and its dispatch."""
 
     def __init__(self, game: Game, index: int):
         super().__init__(game, f"elevator{index}")
         self.index = index
-
-    @property
-    def waiting(self) -> int:
-        return self._count("waiting")
-
-    @property
-    def loaded(self) -> int:
-        return self._count("loaded")
 
     @property
     def enable_button(self) -> EnableState:
@@ -306,16 +290,22 @@ class RideControl(_Unit):
         super().__init__(game, "control")
 
     @property
-    def front_waiting(self) -> int:
+    def front_waiting(self) -> Count:
         return self._count("front_waiting")
 
     @property
-    def back_waiting(self) -> int:
+    def back_waiting(self) -> Count:
         return self._count("back_waiting")
 
     @property
-    def visitor_counter(self) -> int:
-        return self._count("visitor_counter")
+    def front_queue_is_full(self) -> bool:
+        """21 in the front queue."""
+        return self._count("front_waiting").is_full
+
+    @property
+    def back_queue_is_full(self) -> bool:
+        """21 in the back queue."""
+        return self._count("back_waiting").is_full
 
     @property
     def attraction(self) -> AttractionState:
@@ -346,32 +336,16 @@ class RideControl(_Unit):
         return self.daytime is ToggleState.ON
 
     @property
-    def show_fullscreen(self) -> ToggleState:
-        return self._state("show_fullscreen")
-
-    @property
     def ride_sfx(self) -> ToggleState:
         return self._state("ride_sfx")
-
-    @property
-    def ride_sfx_on(self) -> bool:
-        return self.ride_sfx is ToggleState.ON
 
     @property
     def tv_room_sound(self) -> ToggleState:
         return self._state("tv_room_sound")
 
     @property
-    def tv_room_sound_on(self) -> bool:
-        return self.tv_room_sound is ToggleState.ON
-
-    @property
     def bgm(self) -> ToggleState:
         return self._state("bgm")
-
-    @property
-    def bgm_on(self) -> bool:
-        return self.bgm is ToggleState.ON
 
     def toggle_attraction(self) -> None:
         self._press("attraction")
